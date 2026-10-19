@@ -367,8 +367,8 @@
         <button class="btn primary" id="pickFileBtn">📂 Dosya Seç</button>
         <button class="btn" id="pickFolderBtn">🗂️ Klasör Seç</button>
       </div>
-      <div class="formats">Desteklenen: .dcm, .dicom ve uzantısız DICOM dosyaları (tekli ya da çoklu kesit / seri)</div>
-      <div class="hint">🦷 <b>3D dental tomografi (CBCT)</b> geldiyse dosyaları tek tek değil, <b>klasörün tamamını</b> seçin ya da sürükleyin; panoramik görüntü otomatik oluşturulur. WeTransfer veya .zip ile geldiyse önce zip dosyasını çift tıklayıp açın, sonra çıkan klasörü seçin.</div>
+      <div class="formats">Desteklenen: .dcm, .dicom, uzantısız DICOM dosyaları, klasörler ve .zip arşivleri</div>
+      <div class="hint">🦷 <b>3D dental tomografi (CBCT)</b> geldiyse dosyaları tek tek değil, <b>klasörün tamamını</b> seçin ya da sürükleyin; panoramik görüntü otomatik oluşturulur. WeTransfer'den inen <b>.zip</b> dosyasını da açmadan doğrudan seçebilirsiniz.</div>
       <div class="privacy-note">
         <span class="emoji">🔒</span>
         <span>Bu araç tamamen tarayıcınızın içinde çalışır. Seçtiğiniz dosya hiçbir sunucuya, hiçbir kişiye gönderilmez — sekmeyi kapattığınızda bellekten silinir. İnternet bağlantısı olmadan da (dosya bir kez açıldıktan sonra sayfa önbelleğe alınmışsa) kullanılabilir.</span>
@@ -395,7 +395,6 @@
       <div class="progress-text" id="progressText">Yükleniyor…</div>
     </div>
 
-    <div id="errorToast"></div>
 
     <div id="bottomBar">
       <button class="btn icon-only slices-only" id="btnWL" title="Parlaklık / Kontrast (sürükle)">☀️</button>
@@ -406,6 +405,8 @@
       <button class="btn icon-only" id="btnInfoMobile" title="Bilgi">ℹ️</button>
     </div>
   </div>
+
+  <div id="errorToast"></div>
 
   <div id="panelBackdrop"></div>
 
@@ -498,6 +499,7 @@ import {
 import {
   scanDicomFiles, isIgnoredFile, detectArch, computePanoramic, renderPanoramic
 } from "./pano.js";
+import {isZipFile, extractZip} from "./zip.js";
 
 // ---------- DOM refs ----------
 const $ = (id) => document.getElementById(id);
@@ -709,8 +711,10 @@ let currentSeries = null;
 let loadToken = 0;
 
 async function loadFiles(fileList){
-  const files = Array.from(fileList).filter(f => !isIgnoredFile(f));
-  if (files.length === 0) {
+  const picked = Array.from(fileList);
+  const zips = picked.filter(isZipFile);
+  let files = picked.filter(f => !isZipFile(f) && !isIgnoredFile(f));
+  if (files.length === 0 && zips.length === 0) {
     showError('Seçilenler arasında DICOM dosyası bulunamadı.');
     return;
   }
@@ -720,6 +724,31 @@ async function loadFiles(fileList){
   currentSeries = null;
   pano = null;
   enterViewer();
+  let zipFailed = false;
+  for (const zip of zips) {
+    setLoading(true, 'Zip açılıyor…');
+    try {
+      const inner = await extractZip(zip, (i, n) => {
+        if (token === loadToken) setLoading(true, `Zip açılıyor… ${i}/${n}`);
+      });
+      files = files.concat(inner.filter(f => !isIgnoredFile(f)));
+    } catch (err) {
+      console.error('zip error', err);
+      zipFailed = true;
+      if (token === loadToken) {
+        showError(/encrypted/.test(err.message)
+          ? `${zip.name} şifreli; önce bilgisayarda açıp çıkan klasörü seçin.`
+          : `${zip.name} açılamadı; önce bilgisayarda açıp çıkan klasörü seçin.`);
+      }
+    }
+    if (token !== loadToken) return;
+  }
+  if (files.length === 0) {
+    setLoading(false);
+    backToDropzone();
+    if (!zipFailed) showError('Zip içinde DICOM dosyası bulunamadı.');
+    return;
+  }
   setLoading(true, 'Dosyalar inceleniyor…');
   let result;
   try {
