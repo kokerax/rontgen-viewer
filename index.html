@@ -218,7 +218,61 @@
   #bottomBar.hidden{ display:none; }
   #bottomBar{ flex-wrap:wrap; padding-bottom:calc(14px + env(safe-area-inset-bottom)); }
 
-  #fileInput{ display:none; }
+  #fileInput, #folderInput{ display:none; }
+
+  .drop-actions{ display:flex; gap:10px; justify-content:center; flex-wrap:wrap; }
+  .drop-card .hint{
+    font-size:12.5px; color:var(--text-dim); line-height:1.5;
+    margin:16px 0 0; text-align:left;
+    background:var(--panel); border:1px solid var(--border); border-radius:10px;
+    padding:12px 14px;
+  }
+
+  /* Panoramic (CBCT) view */
+  .pano-view{
+    flex:1 1 auto; position:relative; min-width:0; overflow:hidden;
+    touch-action:none; cursor:grab; display:none;
+  }
+  .pano-view.dragging{ cursor:grabbing; }
+  .pano-view canvas{ position:absolute; left:0; top:0; transform-origin:0 0; image-rendering:auto; }
+  .pano-view .side-label{
+    position:absolute; top:58px; font-size:11px; font-weight:600; letter-spacing:.06em;
+    color:rgba(255,255,255,0.7); background:rgba(0,0,0,0.45);
+    padding:3px 8px; border-radius:6px; pointer-events:none;
+  }
+  .pano-view .side-label.left{ left:12px; }
+  .pano-view .side-label.right{ right:12px; }
+
+  #modeTabs{
+    position:absolute; top:10px; left:50%; transform:translateX(-50%); z-index:13;
+    display:none; gap:4px; padding:4px;
+    background:rgba(20,23,28,0.9); border:1px solid var(--border); border-radius:10px;
+  }
+  #modeTabs.show{ display:flex; }
+  #modeTabs button{
+    appearance:none; border:0; background:transparent; color:var(--text-dim);
+    padding:8px 14px; border-radius:7px; font-size:13px; font-weight:500; cursor:pointer;
+    white-space:nowrap; touch-action:manipulation;
+  }
+  #modeTabs button.active{ background:var(--accent); color:#fff; }
+
+  .series-list{ display:flex; flex-direction:column; gap:6px; }
+  .series-btn{
+    text-align:left; padding:8px 10px; border-radius:7px;
+    border:1px solid var(--border); background:var(--panel2);
+    color:var(--text); font-size:12.5px; cursor:pointer; line-height:1.35;
+  }
+  .series-btn small{ display:block; color:var(--text-dim); font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .series-btn.active{background:var(--accent-dim); border-color:var(--accent);}
+
+  .control{ margin-bottom:12px; }
+  .control label{
+    display:flex; justify-content:space-between; font-size:12px; color:var(--text-dim); margin-bottom:4px;
+  }
+  .control input[type=range]{ width:100%; accent-color:var(--accent); }
+  .panel-note{ font-size:11.5px; color:var(--text-dim); line-height:1.45; margin:8px 0 0; }
+  .btn.block{ width:100%; justify-content:center; }
+  body.mode-pano .slices-only{ display:none !important; }
 
   footer{
     flex:0 0 auto; padding:6px 14px; text-align:center;
@@ -309,8 +363,12 @@
       <div class="big-emoji">🩻</div>
       <h1>Röntgen / DICOM dosyanızı açın</h1>
       <p>Dosyayı buraya sürükleyip bırakın ya da aşağıdan seçin. Görüntü sadece bu tarayıcı sekmesinde, cihazınızda açılır — hiçbir yere yüklenmez, internete gönderilmez.</p>
-      <button class="btn primary" id="pickFileBtn">📂 Dosya Seç</button>
+      <div class="drop-actions">
+        <button class="btn primary" id="pickFileBtn">📂 Dosya Seç</button>
+        <button class="btn" id="pickFolderBtn">🗂️ Klasör Seç</button>
+      </div>
       <div class="formats">Desteklenen: .dcm, .dicom ve uzantısız DICOM dosyaları (tekli ya da çoklu kesit / seri)</div>
+      <div class="hint">🦷 <b>3D dental tomografi (CBCT)</b> geldiyse dosyaları tek tek değil, <b>klasörün tamamını</b> seçin ya da sürükleyin; panoramik görüntü otomatik oluşturulur. WeTransfer veya .zip ile geldiyse önce zip dosyasını çift tıklayıp açın, sonra çıkan klasörü seçin.</div>
       <div class="privacy-note">
         <span class="emoji">🔒</span>
         <span>Bu araç tamamen tarayıcınızın içinde çalışır. Seçtiğiniz dosya hiçbir sunucuya, hiçbir kişiye gönderilmez — sekmeyi kapattığınızda bellekten silinir. İnternet bağlantısı olmadan da (dosya bir kez açıldıktan sonra sayfa önbelleğe alınmışsa) kullanılabilir.</span>
@@ -321,6 +379,17 @@
   <div id="viewerWrap" style="display:none;">
     <div id="layerGroup" class="layer-group"></div>
 
+    <div id="panoView" class="pano-view">
+      <canvas id="panoCanvas"></canvas>
+      <span class="side-label left">SAĞ</span>
+      <span class="side-label right">SOL</span>
+    </div>
+
+    <div id="modeTabs">
+      <button data-mode="pano">🦷 Panoramik</button>
+      <button data-mode="slices">📑 Kesitler</button>
+    </div>
+
     <div id="loadingOverlay">
       <div class="spinner"></div>
       <div class="progress-text" id="progressText">Yükleniyor…</div>
@@ -329,9 +398,9 @@
     <div id="errorToast"></div>
 
     <div id="bottomBar">
-      <button class="btn icon-only" id="btnWL" title="Parlaklık / Kontrast (sürükle)">☀️</button>
-      <button class="btn icon-only" id="btnZoom" title="Yakınlaştır / Kaydır (sürükle)">🔍</button>
-      <button class="btn icon-only" id="btnScroll" title="Kesit gezinme (sürükle)">📑</button>
+      <button class="btn icon-only slices-only" id="btnWL" title="Parlaklık / Kontrast (sürükle)">☀️</button>
+      <button class="btn icon-only slices-only" id="btnZoom" title="Yakınlaştır / Kaydır (sürükle)">🔍</button>
+      <button class="btn icon-only slices-only" id="btnScroll" title="Kesit gezinme (sürükle)">📑</button>
       <button class="btn icon-only" id="btnReset" title="Görünümü sıfırla">↺</button>
       <button class="btn icon-only" id="btnFit" title="Ekrana sığdır">⛶</button>
       <button class="btn icon-only" id="btnInfoMobile" title="Bilgi">ℹ️</button>
@@ -347,7 +416,34 @@
       <button class="close-btn" id="panelCloseBtn" aria-label="Kapat">✕</button>
     </div>
 
-    <div class="panel-section">
+    <div class="panel-section" id="panoSection" style="display:none;">
+      <h3>Panoramik</h3>
+      <div class="control">
+        <label for="panoBright"><span>Parlaklık</span><span id="panoBrightVal">0</span></label>
+        <input type="range" id="panoBright" min="-100" max="100" value="0" step="1">
+      </div>
+      <div class="control">
+        <label for="panoContrast"><span>Kontrast</span><span id="panoContrastVal">0</span></label>
+        <input type="range" id="panoContrast" min="-100" max="100" value="0" step="1">
+      </div>
+      <div class="control">
+        <label for="panoThick"><span>Kesit kalınlığı</span><span id="panoThickVal">20 mm</span></label>
+        <input type="range" id="panoThick" min="2" max="40" value="20" step="1">
+      </div>
+      <div class="control">
+        <label for="panoShift"><span>Eğri konumu (dil ↔ yanak)</span><span id="panoShiftVal">0 mm</span></label>
+        <input type="range" id="panoShift" min="-12" max="12" value="0" step="0.5">
+      </div>
+      <button class="btn block" id="panoDownloadBtn">⬇️ Panoramiği indir (PNG)</button>
+      <p class="panel-note">Panoramik, 3D tomografiden diş kavsi otomatik bulunarak oluşturulur; tanı için cihazın kendi yazılımındaki ölçümlerin yerini tutmaz.</p>
+    </div>
+
+    <div class="panel-section" id="seriesSection" style="display:none;">
+      <h3>Seriler</h3>
+      <div class="series-list" id="seriesList"></div>
+    </div>
+
+    <div class="panel-section slices-only" id="toolsSection">
       <h3>Araçlar</h3>
       <div class="tool-grid">
         <div class="tool-btn active" data-tool="WindowLevel"><span class="emoji">☀️</span><span class="label">Parlaklık</span></div>
@@ -357,7 +453,7 @@
       </div>
     </div>
 
-    <div class="panel-section" id="sliceSection" style="display:none;">
+    <div class="panel-section slices-only" id="sliceSection" style="display:none;">
       <h3>Kesit</h3>
       <div class="slice-row">
         <input type="range" id="sliceSlider" min="0" max="0" value="0" step="1">
@@ -365,7 +461,7 @@
       </div>
     </div>
 
-    <div class="panel-section" id="presetSection" style="display:none;">
+    <div class="panel-section slices-only" id="presetSection" style="display:none;">
       <h3>Ön Ayarlar</h3>
       <div class="preset-list" id="presetList"></div>
     </div>
@@ -378,6 +474,7 @@
 </main>
 
 <input type="file" id="fileInput" multiple>
+<input type="file" id="folderInput" webkitdirectory directory multiple>
 
 <footer>
   Röntgen Görüntüleyici — dosyalarınız yalnızca cihazınızda işlenir, hiçbir sunucuya gönderilmez.
@@ -398,6 +495,9 @@
 import {
   App, AppOptions, ViewConfig, ToolConfig, Index, getDwvVersion
 } from "dwv";
+import {
+  scanDicomFiles, isIgnoredFile, detectArch, computePanoramic, renderPanoramic
+} from "./pano.js";
 
 // ---------- DOM refs ----------
 const $ = (id) => document.getElementById(id);
@@ -421,6 +521,22 @@ const presetSection = $('presetSection');
 const presetList = $('presetList');
 const metaSection = $('metaSection');
 const metaTable = $('metaTable');
+const pickFolderBtn = $('pickFolderBtn');
+const folderInput = $('folderInput');
+const modeTabs = $('modeTabs');
+const panoView = $('panoView');
+const panoCanvas = $('panoCanvas');
+const panoSection = $('panoSection');
+const seriesSection = $('seriesSection');
+const seriesList = $('seriesList');
+const panoBright = $('panoBright');
+const panoBrightVal = $('panoBrightVal');
+const panoContrast = $('panoContrast');
+const panoContrastVal = $('panoContrastVal');
+const panoThick = $('panoThick');
+const panoThickVal = $('panoThickVal');
+const panoShift = $('panoShift');
+const panoShiftVal = $('panoShiftVal');
 
 layerGroupEl.id = 'layerGroup0';
 
@@ -458,10 +574,19 @@ function enterViewer(){
   viewerWrap.style.display = 'flex';
   sidePanel.classList.remove('collapsed');
   openAnotherBtn.style.display = 'inline-flex';
-  requestAnimationFrame(() => requestAnimationFrame(() => app.onResize()));
+  requestAnimationFrame(() => requestAnimationFrame(safeResize));
 }
 
 function backToDropzone(){
+  loadToken++;
+  app.reset();
+  setMode('slices');
+  modeTabs.classList.remove('show');
+  seriesSection.style.display = 'none';
+  seriesList.innerHTML = '';
+  scanResult = null;
+  currentSeries = null;
+  pano = null;
   dropzone.classList.remove('hidden');
   viewerWrap.style.display = 'none';
   sidePanel.classList.add('collapsed');
@@ -523,6 +648,15 @@ app.addEventListener('load', (event) => {
     console.warn('meta read issue', err);
   }
 
+  // the first render can happen before every slice of a series has
+  // arrived, so the slice count is only final here
+  try {
+    const viewLayer = app.getViewLayersByDataId(event.dataid)[0];
+    if (viewLayer) setupSliceUI(viewLayer.getViewController());
+  } catch (err) {
+    console.warn('slice setup issue', err);
+  }
+
   applyTool(currentToolName);
 });
 
@@ -548,7 +682,13 @@ app.addEventListener('loadend', () => {
   }
 });
 
-window.addEventListener('resize', () => { app.onResize(); });
+// dwv throws when asked to fit a hidden (zero sized) container, which
+// happens while the panoramic view is shown
+function safeResize(){
+  if (layerGroupEl.clientWidth > 0 && layerGroupEl.clientHeight > 0) app.onResize();
+}
+
+window.addEventListener('resize', safeResize);
 
 // container can change size without a window resize (viewer becoming
 // visible, side panel toggling, mobile orientation change) - dwv only
@@ -556,24 +696,298 @@ window.addEventListener('resize', () => { app.onResize(); });
 let resizeRaf = null;
 const layerResizeObserver = new ResizeObserver(() => {
   if (resizeRaf) cancelAnimationFrame(resizeRaf);
-  resizeRaf = requestAnimationFrame(() => app.onResize());
+  resizeRaf = requestAnimationFrame(safeResize);
 });
 layerResizeObserver.observe(layerGroupEl);
 
 // ---------- file loading ----------
-function loadFiles(fileList){
-  const files = Array.from(fileList);
-  if (files.length === 0) return;
-  fileNameLabel.textContent = files.length === 1
-    ? files[0].name
-    : `${files.length} dosya (seri)`;
+// Files are scanned first: non-DICOM companions (ViewData.exe, XML, ...)
+// are dropped, the rest is grouped into series. An axial CT stack (dental
+// CBCT) opens as a reconstructed panoramic; anything else goes to dwv.
+let scanResult = null;
+let currentSeries = null;
+let loadToken = 0;
+
+async function loadFiles(fileList){
+  const files = Array.from(fileList).filter(f => !isIgnoredFile(f));
+  if (files.length === 0) {
+    showError('Seçilenler arasında DICOM dosyası bulunamadı.');
+    return;
+  }
+  const token = ++loadToken;
+  app.reset();
+  scanResult = null;
+  currentSeries = null;
+  pano = null;
+  enterViewer();
+  setLoading(true, 'Dosyalar inceleniyor…');
+  let result;
+  try {
+    result = await scanDicomFiles(files, (i, n) => {
+      if (token === loadToken) setLoading(true, `Dosyalar inceleniyor… ${i}/${n}`);
+    });
+  } catch (err) {
+    console.error('scan error', err);
+    result = {series: []};
+  }
+  if (token !== loadToken) return;
+  if (result.series.length === 0) {
+    setLoading(false);
+    // let dwv try anyway; it reports its own error if it fails too
+    showSlicesForFiles(files);
+    return;
+  }
+  scanResult = result;
+  buildSeriesUI(result.series);
+  openSeries(result.series[0]);
+}
+
+function seriesLabel(s){
+  const parts = [];
+  parts.push(s.description || s.modality || 'Seri');
+  if (/(^|[\/_\s-])MAR($|[\/_\s-])/i.test(s.folder)) parts.push('(metal artefaktı azaltılmış)');
+  return parts.join(' ');
+}
+
+function buildSeriesUI(series){
+  seriesList.innerHTML = '';
+  if (series.length < 2) { seriesSection.style.display = 'none'; return; }
+  seriesSection.style.display = 'block';
+  series.forEach(s => {
+    const b = document.createElement('button');
+    b.className = 'series-btn';
+    b.innerHTML = '<span></span><small></small>';
+    b.firstChild.textContent = seriesLabel(s);
+    const folder = s.folder.split('/').pop();
+    b.lastChild.textContent = `${s.files.length} kesit${folder ? ' · ' + folder : ''}`;
+    b.addEventListener('click', () => {
+      if (s !== currentSeries) openSeries(s);
+      if (isMobileLayout()) closeMobilePanel();
+    });
+    s.button = b;
+    seriesList.appendChild(b);
+  });
+}
+
+function openSeries(s){
+  currentSeries = s;
+  seriesList.querySelectorAll('.series-btn').forEach(b => b.classList.toggle('active', b === s.button));
+  fileNameLabel.textContent = s.files.length === 1 ? s.files[0].name : `${s.files.length} dosya (seri)`;
+  slicesLoadedFor = null;
+  app.reset();
+  if (s.volume) {
+    if (!s.arch) s.arch = detectArch(s.volume);
+    if (s.arch) {
+      modeTabs.classList.add('show');
+      setMode('pano');
+      return;
+    }
+  }
+  modeTabs.classList.remove('show');
+  setMode('slices');
+}
+
+function showSlicesForFiles(files){
+  fileNameLabel.textContent = files.length === 1 ? files[0].name : `${files.length} dosya (seri)`;
+  modeTabs.classList.remove('show');
+  setMode('slices', files);
+}
+
+// ---------- mode: panoramic / slices ----------
+let currentMode = 'slices';
+let slicesLoadedFor = null;
+
+function setMode(mode, filesOverride){
+  currentMode = mode;
+  document.body.classList.toggle('mode-pano', mode === 'pano');
+  modeTabs.querySelectorAll('button').forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
+  panoView.style.display = mode === 'pano' ? 'block' : 'none';
+  layerGroupEl.style.display = mode === 'pano' ? 'none' : '';
+  panoSection.style.display = mode === 'pano' ? 'block' : 'none';
+  if (mode === 'pano') {
+    setLoading(false);
+    showPanoramic();
+    return;
+  }
+  const files = filesOverride || (currentSeries && currentSeries.files);
+  if (!files) return;
+  if (slicesLoadedFor === files) {
+    requestAnimationFrame(safeResize);
+    return;
+  }
+  slicesLoadedFor = files;
+  app.reset();
+  isFirstRender = true;
   app.loadFiles(files);
 }
 
+modeTabs.querySelectorAll('button').forEach(b => {
+  b.addEventListener('click', () => { if (b.dataset.mode !== currentMode) setMode(b.dataset.mode); });
+});
+
+// ---------- panoramic view ----------
+let pano = null;           // {series, image, thickness, shift}
+const panoCtx = panoCanvas.getContext('2d');
+const panoXf = {scale: 1, x: 0, y: 0};
+
+function panoParams(){
+  return {thicknessMm: Number(panoThick.value), shiftMm: Number(panoShift.value)};
+}
+
+function showPanoramic(){
+  const s = currentSeries;
+  if (!s || !s.volume || !s.arch) return;
+  const params = panoParams();
+  const sameParams = pano && pano.series === s &&
+    pano.thicknessMm === params.thicknessMm && pano.shiftMm === params.shiftMm;
+  if (!sameParams) {
+    const image = computePanoramic(s.volume, s.arch, params);
+    if (!image) {
+      showError('Panoramik oluşturulamadı; kesitler gösteriliyor.');
+      modeTabs.classList.remove('show');
+      setMode('slices');
+      return;
+    }
+    const fresh = !pano || pano.series !== s;
+    pano = {series: s, image, ...params};
+    panoCanvas.width = image.width;
+    panoCanvas.height = image.height;
+    // pixels are not square in mm: stretch the canvas, not the data
+    panoCanvas.style.width = image.width + 'px';
+    panoCanvas.style.height = (image.height * image.pixelMm[1] / image.pixelMm[0]) + 'px';
+    drawPanoramic();
+    if (fresh) requestAnimationFrame(fitPanoramic);
+  } else {
+    requestAnimationFrame(fitPanoramic);
+  }
+}
+
+function panoWindow(){
+  const {lo, hi} = pano.image;
+  const range = hi - lo;
+  const b = Number(panoBright.value) / 100;   // -1..1
+  const c = Number(panoContrast.value) / 100; // -1..1
+  const width = range * Math.pow(4, -c);
+  const center = (lo + hi) / 2 - b * range * 0.5;
+  return [center - width / 2, center + width / 2];
+}
+
+function drawPanoramic(){
+  if (!pano) return;
+  const [lo, hi] = panoWindow();
+  const img = panoCtx.createImageData(pano.image.width, pano.image.height);
+  renderPanoramic(pano.image, lo, hi, img);
+  panoCtx.putImageData(img, 0, 0);
+}
+
+function applyPanoXf(){
+  panoCanvas.style.transform = `translate(${panoXf.x}px, ${panoXf.y}px) scale(${panoXf.scale})`;
+}
+
+function fitPanoramic(){
+  if (!pano) return;
+  const vw = panoView.clientWidth, vh = panoView.clientHeight;
+  const cw = parseFloat(panoCanvas.style.width), ch = parseFloat(panoCanvas.style.height);
+  if (!vw || !vh) return;
+  // leave room for the mode tabs on top and the toolbar at the bottom
+  const top = 56, bottom = 70;
+  const s = Math.min(vw / cw, (vh - top - bottom) / ch);
+  panoXf.scale = s;
+  panoXf.x = (vw - cw * s) / 2;
+  panoXf.y = top + (vh - top - bottom - ch * s) / 2;
+  applyPanoXf();
+}
+
+function zoomPanoAt(px, py, factor){
+  const s = Math.min(20, Math.max(0.1, panoXf.scale * factor));
+  const k = s / panoXf.scale;
+  panoXf.x = px - (px - panoXf.x) * k;
+  panoXf.y = py - (py - panoXf.y) * k;
+  panoXf.scale = s;
+  applyPanoXf();
+}
+
+panoView.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const r = panoView.getBoundingClientRect();
+  zoomPanoAt(e.clientX - r.left, e.clientY - r.top, Math.exp(-e.deltaY * 0.0015));
+}, {passive: false});
+
+const panoPointers = new Map();
+let panoPinch = null;
+panoView.addEventListener('pointerdown', (e) => {
+  panoView.setPointerCapture(e.pointerId);
+  panoPointers.set(e.pointerId, {x: e.clientX, y: e.clientY});
+  panoView.classList.add('dragging');
+  panoPinch = null;
+});
+panoView.addEventListener('pointermove', (e) => {
+  const prev = panoPointers.get(e.pointerId);
+  if (!prev) return;
+  const cur = {x: e.clientX, y: e.clientY};
+  panoPointers.set(e.pointerId, cur);
+  if (panoPointers.size === 1) {
+    panoXf.x += cur.x - prev.x;
+    panoXf.y += cur.y - prev.y;
+    applyPanoXf();
+  } else if (panoPointers.size === 2) {
+    const [a, b] = [...panoPointers.values()];
+    const dist = Math.hypot(a.x - b.x, a.y - b.y);
+    const r = panoView.getBoundingClientRect();
+    const mx = (a.x + b.x) / 2 - r.left, my = (a.y + b.y) / 2 - r.top;
+    if (panoPinch) {
+      panoXf.x += mx - panoPinch.mx;
+      panoXf.y += my - panoPinch.my;
+      zoomPanoAt(mx, my, dist / panoPinch.dist);
+    }
+    panoPinch = {dist, mx, my};
+  }
+});
+['pointerup', 'pointercancel'].forEach(evt => panoView.addEventListener(evt, (e) => {
+  panoPointers.delete(e.pointerId);
+  panoPinch = null;
+  if (panoPointers.size === 0) panoView.classList.remove('dragging');
+}));
+panoView.addEventListener('dblclick', fitPanoramic);
+
+new ResizeObserver(() => { if (currentMode === 'pano') fitPanoramic(); }).observe(panoView);
+
+panoBright.addEventListener('input', () => { panoBrightVal.textContent = panoBright.value; drawPanoramic(); });
+panoContrast.addEventListener('input', () => { panoContrastVal.textContent = panoContrast.value; drawPanoramic(); });
+let panoRecalcTimer = null;
+function schedulePanoRecalc(){
+  panoThickVal.textContent = `${panoThick.value} mm`;
+  panoShiftVal.textContent = `${Number(panoShift.value) > 0 ? '+' : ''}${panoShift.value} mm`;
+  clearTimeout(panoRecalcTimer);
+  panoRecalcTimer = setTimeout(() => { if (currentMode === 'pano') showPanoramic(); }, 120);
+}
+panoThick.addEventListener('input', schedulePanoRecalc);
+panoShift.addEventListener('input', schedulePanoRecalc);
+
+$('panoDownloadBtn').addEventListener('click', () => {
+  if (!pano) return;
+  // export with square pixels so the image is not squashed
+  const out = document.createElement('canvas');
+  out.width = pano.image.width;
+  out.height = Math.round(pano.image.height * pano.image.pixelMm[1] / pano.image.pixelMm[0]);
+  const ctx = out.getContext('2d');
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(panoCanvas, 0, 0, out.width, out.height);
+  out.toBlob((blob) => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'panoramik.png';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  }, 'image/png');
+});
+
 pickFileBtn.addEventListener('click', () => fileInput.click());
+pickFolderBtn.addEventListener('click', () => folderInput.click());
 openAnotherBtn.addEventListener('click', () => {
   backToDropzone();
-  fileInput.click();
 });
 fileInput.addEventListener('change', (e) => {
   if (e.target.files && e.target.files.length) {
@@ -581,6 +995,43 @@ fileInput.addEventListener('change', (e) => {
   }
   fileInput.value = '';
 });
+folderInput.addEventListener('change', (e) => {
+  if (e.target.files && e.target.files.length) {
+    loadFiles(e.target.files);
+  }
+  folderInput.value = '';
+});
+
+// dropped folders arrive as directory entries, not files
+async function filesFromDataTransfer(dt){
+  const entries = [];
+  if (dt.items) {
+    for (const item of dt.items) {
+      const entry = item.webkitGetAsEntry && item.webkitGetAsEntry();
+      if (entry) entries.push(entry);
+    }
+  }
+  if (entries.length === 0 || entries.every(en => en.isFile)) {
+    return Array.from(dt.files || []);
+  }
+  const out = [];
+  async function walk(entry, path){
+    if (entry.isFile) {
+      const file = await new Promise((res, rej) => entry.file(res, rej));
+      try { Object.defineProperty(file, 'relativePath', {value: path + file.name}); } catch (e) { /* read-only */ }
+      out.push(file);
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader();
+      for (;;) {
+        const batch = await new Promise((res, rej) => reader.readEntries(res, rej));
+        if (batch.length === 0) break;
+        for (const child of batch) await walk(child, path + entry.name + '/');
+      }
+    }
+  }
+  for (const entry of entries) await walk(entry, '');
+  return out;
+}
 
 // drag & drop over whole page
 ['dragenter','dragover'].forEach(evt => {
@@ -595,13 +1046,12 @@ fileInput.addEventListener('change', (e) => {
     dropzone.classList.remove('dragover');
   });
 });
-document.addEventListener('drop', (e) => {
+document.addEventListener('drop', async (e) => {
   e.preventDefault();
   const dt = e.dataTransfer;
-  if (dt && dt.files && dt.files.length) {
-    if (!hasData) enterViewer();
-    loadFiles(dt.files);
-  }
+  if (!dt) return;
+  const files = await filesFromDataTransfer(dt);
+  if (files.length) loadFiles(files);
 });
 
 // ---------- tools ----------
@@ -644,8 +1094,8 @@ $('resetToolBtn').addEventListener('click', () => app.resetZoomPan());
 $('btnWL').addEventListener('click', () => applyTool('WindowLevel'));
 $('btnZoom').addEventListener('click', () => applyTool('ZoomAndPan'));
 $('btnScroll').addEventListener('click', () => applyTool('Scroll'));
-$('btnReset').addEventListener('click', () => app.resetZoomPan());
-$('btnFit').addEventListener('click', () => app.resetZoomPan());
+$('btnReset').addEventListener('click', () => currentMode === 'pano' ? fitPanoramic() : app.resetZoomPan());
+$('btnFit').addEventListener('click', () => currentMode === 'pano' ? fitPanoramic() : app.resetZoomPan());
 $('btnInfoMobile').addEventListener('click', toggleMobilePanel);
 panelCloseBtn.addEventListener('click', closeMobilePanel);
 panelBackdrop.addEventListener('click', closeMobilePanel);
