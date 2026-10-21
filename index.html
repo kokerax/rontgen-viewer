@@ -497,7 +497,7 @@ import {
   App, AppOptions, ViewConfig, ToolConfig, Index, getDwvVersion
 } from "dwv";
 import {
-  scanDicomFiles, isIgnoredFile, detectArch, computePanoramic, renderPanoramic
+  scanDicomFiles, isIgnoredFile, sniffDicom, detectArch, computePanoramic, renderPanoramic
 } from "./pano.js";
 import {isZipFile, extractZip} from "./zip.js";
 
@@ -730,6 +730,9 @@ async function loadFiles(fileList){
     try {
       const inner = await extractZip(zip, (i, n) => {
         if (token === loadToken) setLoading(true, `Zip açılıyor… ${i}/${n}`);
+      }, {
+        skipName: (name) => isIgnoredFile({name}),
+        sniff: (head) => sniffDicom(head) !== null
       });
       files = files.concat(inner.filter(f => !isIgnoredFile(f)));
     } catch (err) {

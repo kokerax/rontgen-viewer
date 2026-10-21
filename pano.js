@@ -25,6 +25,62 @@ export function isIgnoredFile(file){
   return IGNORED_NAME.test(file.name);
 }
 
+const VRS = new Set(['AE', 'AS', 'AT', 'CS', 'DA', 'DS', 'DT', 'FD', 'FL', 'IS', 'LO', 'LT',
+  'OB', 'OD', 'OF', 'OL', 'OV', 'OW', 'PN', 'SH', 'SL', 'SQ', 'SS', 'ST', 'SV', 'TM',
+  'UC', 'UI', 'UL', 'UN', 'UR', 'US', 'UT', 'UV']);
+
+const IMPLICIT_LE = '1.2.840.10008.1.2';
+
+// Part 10 file meta header (preamble, DICM, group 0002) declaring the
+// given transfer syntax, in explicit VR little endian.
+function buildFileMeta(transferSyntax){
+  const enc = new TextEncoder();
+  const uid = transferSyntax.length % 2 ? transferSyntax + '\0' : transferSyntax;
+  // (0002,0001) OB, 2 reserved bytes, 4-byte length = 2, value 00 01
+  const version = new Uint8Array([0x02, 0x00, 0x01, 0x00, 'O'.charCodeAt(0), 'B'.charCodeAt(0),
+    0, 0, 2, 0, 0, 0, 0, 1]);
+  const tsHead = new Uint8Array([0x02, 0x00, 0x10, 0x00, 'U'.charCodeAt(0), 'I'.charCodeAt(0), uid.length, 0]);
+  const tsVal = enc.encode(uid);
+  const groupLen = version.length + tsHead.length + tsVal.length;
+  const lenEl = new Uint8Array([0x02, 0x00, 0x00, 0x00, 'U'.charCodeAt(0), 'L'.charCodeAt(0), 4, 0,
+    groupLen & 0xff, (groupLen >> 8) & 0xff, 0, 0]);
+  const pre = new Uint8Array(132);
+  pre.set(enc.encode('DICM'), 128);
+  return [pre, lenEl, version, tsHead, tsVal];
+}
+
+// Some vendors (e.g. J. Morita OneVolumeViewer exports) write bare
+// datasets: no preamble, no file meta, implicit VR. dwv then guesses
+// explicit VR and misreads every tag. Detect that and prepend a proper
+// meta header. Returns null for files that do not look like DICOM, so
+// large vendor blobs (.vol, .pak) are never read whole.
+// Classifies the first 132 bytes of a file: 'part10' (preamble + DICM),
+// 'explicit' / 'implicit' (bare dataset) or null (not DICOM).
+export function sniffDicom(head){
+  if (head.length < 132) return null;
+  if (head[128] === 0x44 && head[129] === 0x49 && head[130] === 0x43 && head[131] === 0x4d) return 'part10';
+  const group = head[0] | (head[1] << 8);
+  const element = head[2] | (head[3] << 8);
+  // a dataset starts with a low even group (0002, 0008, ...) and small element
+  if (group % 2 !== 0 || group === 0 || group > 0x0028 || element > 0x00ff) return null;
+  if (VRS.has(String.fromCharCode(head[4], head[5]))) return 'explicit';
+  return group === 0x0002 ? null : 'implicit'; // meta group is always explicit
+}
+
+export async function normalizeDicomFile(file){
+  if (file.size < 132) return null;
+  const kind = sniffDicom(new Uint8Array(await file.slice(0, 132).arrayBuffer()));
+  if (!kind) return null;
+  // explicit VR: dwv's default guess for bare datasets is right
+  if (kind !== 'implicit') return file;
+  const fixed = new File([...buildFileMeta(IMPLICIT_LE), file], file.name);
+  const rel = file.webkitRelativePath || file.relativePath;
+  if (rel) {
+    try { Object.defineProperty(fixed, 'relativePath', {value: rel}); } catch (err) { /* read-only */ }
+  }
+  return fixed;
+}
+
 function first(elements, key){
   const el = elements[key];
   if (!el || !el.value || el.value.length === 0) return undefined;
@@ -82,7 +138,7 @@ export async function scanDicomFiles(files, onProgress){
   const seriesMap = new Map();
   let skipped = 0;
   for (let i = 0; i < files.length; i++) {
-    const file = files[i];
+    let file = files[i];
     if (onProgress && (i % 10 === 0 || i === files.length - 1)) {
       onProgress(i + 1, files.length);
       await new Promise(r => setTimeout(r, 0));
@@ -91,6 +147,9 @@ export async function scanDicomFiles(files, onProgress){
 
     let elements;
     try {
+      const dicomFile = await normalizeDicomFile(file);
+      if (!dicomFile) { skipped++; continue; }
+      file = dicomFile;
       const buffer = await file.arrayBuffer();
       const parser = new DicomParser();
       parser.parse(buffer);
@@ -211,7 +270,10 @@ function volumeHistogram(vol, stride){
 // implants) inside the slices that contain teeth.
 export function detectArch(vol){
   const {hist, total} = volumeHistogram(vol, 7);
-  const hi = percentileFromHistogram(hist, total, 0.995);
+  // only enamel and metal are this dense; a looser cut also takes in the
+  // skull and spine of large field-of-view scans and the band covers
+  // the whole head
+  const hi = percentileFromHistogram(hist, total, 0.9997);
 
   const prof = vol.data.map(slice => {
     let n = 0;
@@ -231,28 +293,48 @@ export function detectArch(vol){
     const slice = vol.data[z];
     for (let i = 0; i < n; i++) if (slice[i] > mip[i]) mip[i] = slice[i];
   }
-  const sortedMip = Int16Array.from(mip).sort();
-  const thr = sortedMip[Math.floor(n * 0.97)];
-
-  // least squares for y = a x^2 + b x + c
-  let S0 = 0, S1 = 0, S2 = 0, S3 = 0, S4 = 0, T0 = 0, T1 = 0, T2 = 0;
+  let thr = hi;
+  let count = 0;
+  for (let i = 0; i < n; i++) if (mip[i] > thr) count++;
+  if (count < 50) {
+    thr = Int16Array.from(mip).sort()[Math.floor(n * 0.97)];
+  }
+  const xs = [], ys = [];
   for (let y = 0; y < vol.ny; y++) {
     for (let x = 0; x < vol.nx; x++) {
-      if (mip[y * vol.nx + x] <= thr) continue;
-      const x2 = x * x;
-      S0++; S1 += x; S2 += x2; S3 += x2 * x; S4 += x2 * x2;
-      T0 += y; T1 += x * y; T2 += x2 * y;
+      if (mip[y * vol.nx + x] > thr) { xs.push(x); ys.push(y); }
     }
   }
-  if (S0 < 50) return null;
-  const coef = solve3([[S4, S3, S2], [S3, S2, S1], [S2, S1, S0]], [T2, T1, T0]);
+  if (xs.length < 50) return null;
+
+  let coef = fitParabola(xs, ys, null);
+  // refit without outliers (spine, stray metal) a few times
+  for (let it = 0; it < 3 && coef; it++) {
+    const res = xs.map((x, i) => Math.abs(coef[0] * x * x + coef[1] * x + coef[2] - ys[i]));
+    const cut = Math.max(Float64Array.from(res).sort()[Math.floor(res.length * 0.8)], 3);
+    const next = fitParabola(xs, ys, res.map(r => r < cut));
+    if (!next) break;
+    coef = next;
+  }
   if (!coef) return null;
   const [a, b, c] = coef;
   // a real arch bends noticeably across the field of view
-  const xs = S1 / S0;
   const bend = Math.abs(a) * (vol.nx / 2) * (vol.nx / 2);
-  if (bend < vol.ny * 0.08 || !Number.isFinite(xs)) return null;
+  if (bend < vol.ny * 0.08) return null;
   return {a, b, c, z0, z1};
+}
+
+// least squares for y = a x^2 + b x + c over the points where keep[i]
+function fitParabola(xs, ys, keep){
+  let S0 = 0, S1 = 0, S2 = 0, S3 = 0, S4 = 0, T0 = 0, T1 = 0, T2 = 0;
+  for (let i = 0; i < xs.length; i++) {
+    if (keep && !keep[i]) continue;
+    const x = xs[i], y = ys[i], x2 = x * x;
+    S0++; S1 += x; S2 += x2; S3 += x2 * x; S4 += x2 * x2;
+    T0 += y; T1 += x * y; T2 += x2 * y;
+  }
+  if (S0 < 20) return null;
+  return solve3([[S4, S3, S2], [S3, S2, S1], [S2, S1, S0]], [T2, T1, T0]);
 }
 
 function solve3(M, v){
@@ -323,6 +405,23 @@ function archCurve(vol, arch){
   return {points: curve, lengthMm: L, stepMm};
 }
 
+// CBCT volumes fill the corners outside the round field of view with one
+// constant (often the type minimum). Returns it when it covers a large
+// part of the volume, else null.
+function paddingValue(vol){
+  if (vol.pad !== undefined) return vol.pad;
+  let min = 32767;
+  for (const slice of vol.data) for (let i = 0; i < slice.length; i += 5) if (slice[i] < min) min = slice[i];
+  let cnt = 0, tot = 0;
+  for (const slice of vol.data) {
+    for (let i = 0; i < slice.length; i += 5) { tot++; if (slice[i] === min) cnt++; }
+  }
+  // and it must be what fills the corners, not just dense air
+  const mid = vol.data[vol.data.length >> 1];
+  vol.pad = cnt > tot * 0.02 && mid[0] === min ? min : null;
+  return vol.pad;
+}
+
 // Builds the panoramic image: for each point of the arch and each slice,
 // the mean value through a slab of `thicknessMm` across the arch,
 // optionally shifted buccally (+) or lingually (-) by `shiftMm`.
@@ -351,6 +450,7 @@ export function computePanoramic(vol, arch, {thicknessMm = 20, shiftMm = 0} = {}
 
   const out = new Float32Array(W * H);
   const {nx, ny} = vol;
+  const pad = paddingValue(vol);
   for (let z = 0; z < H; z++) {
     const slice = vol.data[z];
     const row = (H - 1 - z) * W; // superior at the top
@@ -362,6 +462,9 @@ export function computePanoramic(vol, arch, {thicknessMm = 20, shiftMm = 0} = {}
         const x0 = x | 0, y0 = y | 0;
         const fx = x - x0, fy = y - y0;
         const idx = y0 * nx + x0;
+        // skip samples touching the area outside the scanned cylinder
+        if (pad !== null && (slice[idx] === pad || slice[idx + 1] === pad ||
+            slice[idx + nx] === pad || slice[idx + nx + 1] === pad)) continue;
         const v = (slice[idx] * (1 - fx) + slice[idx + 1] * fx) * (1 - fy) +
                   (slice[idx + nx] * (1 - fx) + slice[idx + nx + 1] * fx) * fy;
         sum += v; cnt++;
@@ -372,7 +475,9 @@ export function computePanoramic(vol, arch, {thicknessMm = 20, shiftMm = 0} = {}
 
   // default display window from the image's own distribution
   const finite = out.filter(Number.isFinite).sort();
-  const lo = finite.length ? finite[Math.floor(finite.length * 0.01)] : 0;
+  // a darker floor than the minimum keeps soft tissue from washing out
+  // the bone, close to how a panoramic radiograph looks
+  const lo = finite.length ? finite[Math.floor(finite.length * 0.10)] : 0;
   const hi = finite.length ? finite[Math.floor(finite.length * 0.998)] : 1;
   return {
     width: W, height: H, data: out,

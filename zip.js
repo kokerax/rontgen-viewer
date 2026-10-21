@@ -84,9 +84,31 @@ function parseEntries(cd, count){
   return entries;
 }
 
+// Reads the first `n` inflated bytes of a deflated entry.
+async function inflateHead(raw, n){
+  const reader = raw.stream().pipeThrough(new DecompressionStream('deflate-raw')).getReader();
+  const out = new Uint8Array(n);
+  let got = 0;
+  try {
+    while (got < n) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      const take = Math.min(value.length, n - got);
+      out.set(value.subarray(0, take), got);
+      got += take;
+    }
+  } finally {
+    reader.cancel().catch(() => {});
+  }
+  return out.subarray(0, got);
+}
+
 // Returns the archive's files as File objects carrying a `relativePath`
 // (archive path), like files coming from a dropped folder.
-export async function extractZip(zip, onProgress){
+// `options.skipName(name)` drops entries by name; `options.sniff(head)`
+// sees the first 132 bytes of a compressed entry and decides whether it
+// is worth inflating (vendor volumes can be close to a gigabyte).
+export async function extractZip(zip, onProgress, options = {}){
   const {count, size, offset} = await findCentralDirectory(zip);
   const cd = await readBytes(zip, offset, offset + size);
   const entries = parseEntries(cd, count).filter(en =>
@@ -96,6 +118,8 @@ export async function extractZip(zip, onProgress){
   for (let i = 0; i < entries.length; i++) {
     const en = entries[i];
     if (onProgress && (i % 20 === 0 || i === entries.length - 1)) onProgress(i + 1, entries.length);
+    const base = en.name.slice(en.name.lastIndexOf('/') + 1);
+    if (options.skipName && options.skipName(base)) continue;
     if (en.flags & 1) throw new Error('zip: encrypted');
     const local = await readBytes(zip, en.localOffset, en.localOffset + 30);
     if (local.getUint32(0, true) !== LOCAL_SIG) throw new Error('zip: bad local header');
@@ -106,12 +130,12 @@ export async function extractZip(zip, onProgress){
       blob = raw;
     } else if (en.method === 8) {
       if (typeof DecompressionStream === 'undefined') throw new Error('zip: no DecompressionStream');
+      if (options.sniff && !options.sniff(await inflateHead(raw, 132))) continue;
       blob = await new Response(raw.stream().pipeThrough(new DecompressionStream('deflate-raw'))).blob();
     } else {
       // unsupported compression (e.g. deflate64, bzip2): skip the entry
       continue;
     }
-    const base = en.name.slice(en.name.lastIndexOf('/') + 1);
     const file = new File([blob], base);
     try { Object.defineProperty(file, 'relativePath', {value: en.name}); } catch (err) { /* read-only */ }
     out.push(file);
