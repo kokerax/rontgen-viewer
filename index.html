@@ -273,6 +273,7 @@
     white-space:nowrap; touch-action:manipulation;
   }
   #modeTabs button.active{ background:var(--accent); color:#fff; }
+  #modeTabs button.unavailable{ opacity:.65; }
 
   .series-list{ display:flex; flex-direction:column; gap:6px; }
   .series-btn{
@@ -304,6 +305,12 @@
   footer a{color:var(--text-dim);}
 
   @media (max-width: 760px){
+    #modeTabs{
+      left:8px; right:8px; transform:none; max-width:none;
+      overflow-x:auto; scrollbar-width:none;
+    }
+    #modeTabs::-webkit-scrollbar{display:none;}
+    #modeTabs button{flex:0 0 auto;}
     header .logo .label{ display:none; }
     header .privacy-badge .long-text{ display:none; }
     header .privacy-badge .short-text{ display:inline; }
@@ -907,15 +914,17 @@ async function openSeries(s){
   slicesLoadedFor = null;
   app.reset();
   if (s.volume && !s.arch) s.arch = detectArch(s.volume);
+  const panoButton = modeTabs.querySelector('[data-mode="pano"]');
+  panoButton.style.display = s.files.length > 1 ? '' : 'none';
+  panoButton.classList.toggle('unavailable', !s.arch);
+  panoButton.title = s.arch ? 'Diş kavsi boyunca panoramik görünüm' : 'Bu seride otomatik panoramik oluşturulamadı';
   if (s.arch || s.overview) {
-    modeTabs.querySelector('[data-mode="pano"]').style.display = s.arch ? '' : 'none';
     modeTabs.querySelector('[data-mode="overview"]').style.display = s.overview ? '' : 'none';
     modeTabs.querySelector('[data-mode="volume"]').style.display = s.files.length > 1 ? '' : 'none';
     modeTabs.classList.add('show');
     setMode(s.arch ? 'pano' : 'overview');
     return;
   }
-  modeTabs.querySelector('[data-mode="pano"]').style.display = 'none';
   modeTabs.querySelector('[data-mode="overview"]').style.display = '';
   modeTabs.querySelector('[data-mode="volume"]').style.display = s.files.length > 1 ? '' : 'none';
   modeTabs.classList.toggle('show', s.files.length > 1);
@@ -925,7 +934,10 @@ async function openSeries(s){
 function showSlicesForFiles(files){
   currentSeries = {files, overview: null, arch: null};
   fileNameLabel.textContent = files.length === 1 ? files[0].name : `${files.length} dosya (seri)`;
-  modeTabs.querySelector('[data-mode="pano"]').style.display = 'none';
+  const panoButton = modeTabs.querySelector('[data-mode="pano"]');
+  panoButton.style.display = files.length > 1 ? '' : 'none';
+  panoButton.classList.add('unavailable');
+  panoButton.title = 'Bu seride otomatik panoramik oluşturulamadı';
   modeTabs.querySelector('[data-mode="overview"]').style.display = '';
   modeTabs.querySelector('[data-mode="volume"]').style.display = files.length > 1 ? '' : 'none';
   modeTabs.classList.toggle('show', files.length > 1);
@@ -1108,6 +1120,10 @@ async function buildDecodedOverview(series, targetMode = 'overview'){
 }
 
 function setMode(mode, filesOverride){
+  if (mode === 'pano' && currentSeries && !currentSeries.arch) {
+    showError('Bu seride otomatik diş kavsi bulunamadı. CBCT klasörünün tamamını veya başka bir seriyi açın.');
+    return;
+  }
   if (mode === 'overview' && currentSeries && !currentSeries.overview) {
     buildDecodedOverview(currentSeries);
     return;
@@ -1200,16 +1216,19 @@ function showPanoramic(){
   if (!sameParams) {
     const image = isOverview ? s.overview : computePanoramic(s.volume, s.arch, params);
     if (!image) {
+      if (!isOverview) {
+        modeTabs.querySelector('[data-mode="pano"]').classList.add('unavailable');
+      }
       if (!isOverview && s.overview) {
-        modeTabs.querySelector('[data-mode="pano"]').style.display = 'none';
         setMode('overview');
+        showError('Bu seride panoramik üretilemedi. Birleşik görünüm açıldı.');
         return;
       }
       showError('Panoramik oluşturulamadı; kesitler gösteriliyor.');
-      modeTabs.classList.remove('show');
       setMode('slices');
       return;
     }
+    if (!isOverview) modeTabs.querySelector('[data-mode="pano"]').classList.remove('unavailable');
     const fresh = !pano || pano.series !== s || pano.mode !== currentMode;
     pano = {series: s, mode: currentMode, image, ...params};
     panoCanvas.width = image.width;
