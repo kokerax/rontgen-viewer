@@ -283,8 +283,10 @@
   .panel-note{ font-size:11.5px; color:var(--text-dim); line-height:1.45; margin:8px 0 0; }
   .btn.block{ width:100%; justify-content:center; }
   body.mode-pano .slices-only{ display:none !important; }
+  body:not(.mode-pano) .projection-only{ display:none !important; }
   body.mode-overview .pano-only,
   body.mode-overview .side-label{ display:none !important; }
+  body.rotated-projection .side-label{ display:none !important; }
 
   footer{
     flex:0 0 auto; padding:6px 14px; text-align:center;
@@ -418,6 +420,10 @@
       <button class="btn icon-only slices-only" id="btnWL" title="Parlaklık / Kontrast (sürükle)">☀️</button>
       <button class="btn icon-only slices-only" id="btnZoom" title="Yakınlaştır / Kaydır (sürükle)">🔍</button>
       <button class="btn icon-only slices-only" id="btnScroll" title="Kesit gezinme (sürükle)">📑</button>
+      <button class="btn icon-only projection-only" id="projectionZoomOut" title="Uzaklaştır" aria-label="Uzaklaştır">−</button>
+      <button class="btn icon-only projection-only" id="projectionZoomIn" title="Yakınlaştır" aria-label="Yakınlaştır">+</button>
+      <button class="btn icon-only projection-only" id="projectionRotateLeft" title="Sola 90° döndür" aria-label="Sola 90 derece döndür">↶</button>
+      <button class="btn icon-only projection-only" id="projectionRotateRight" title="Sağa 90° döndür" aria-label="Sağa 90 derece döndür">↷</button>
       <button class="btn icon-only" id="btnReset" title="Görünümü sıfırla">↺</button>
       <button class="btn icon-only" id="btnFit" title="Ekrana sığdır">⛶</button>
       <button class="btn icon-only" id="btnInfoMobile" title="Bilgi">ℹ️</button>
@@ -1088,7 +1094,7 @@ modeTabs.querySelectorAll('button').forEach(b => {
 // ---------- panoramic view ----------
 let pano = null;           // {series, image, thickness, shift}
 const panoCtx = panoCanvas.getContext('2d');
-const panoXf = {scale: 1, x: 0, y: 0};
+const panoXf = {scale: 1, x: 0, y: 0, angle: 0};
 
 function panoParams(){
   return {thicknessMm: Number(panoThick.value), shiftMm: Number(panoShift.value)};
@@ -1127,7 +1133,10 @@ function showPanoramic(){
     panoCanvas.style.width = image.width + 'px';
     panoCanvas.style.height = (image.height * image.pixelMm[1] / image.pixelMm[0]) + 'px';
     drawPanoramic();
-    if (fresh) requestAnimationFrame(fitPanoramic);
+    if (fresh) {
+      panoXf.angle = 0;
+      requestAnimationFrame(fitPanoramic);
+    }
   } else {
     requestAnimationFrame(fitPanoramic);
   }
@@ -1152,7 +1161,14 @@ function drawPanoramic(){
 }
 
 function applyPanoXf(){
-  panoCanvas.style.transform = `translate(${panoXf.x}px, ${panoXf.y}px) scale(${panoXf.scale})`;
+  const cw = parseFloat(panoCanvas.style.width), ch = parseFloat(panoCanvas.style.height);
+  const radians = panoXf.angle * Math.PI / 180;
+  const cos = Math.cos(radians), sin = Math.sin(radians), scale = panoXf.scale;
+  const a = scale * cos, b = scale * sin, c = -scale * sin, d = scale * cos;
+  const e = panoXf.x - a * cw / 2 - c * ch / 2;
+  const f = panoXf.y - b * cw / 2 - d * ch / 2;
+  panoCanvas.style.transform = `matrix(${a}, ${b}, ${c}, ${d}, ${e}, ${f})`;
+  document.body.classList.toggle('rotated-projection', panoXf.angle % 360 !== 0);
 }
 
 function fitPanoramic(){
@@ -1162,10 +1178,13 @@ function fitPanoramic(){
   if (!vw || !vh) return;
   // leave room for the mode tabs on top and the toolbar at the bottom
   const top = 56, bottom = 70;
-  const s = Math.min(vw / cw, (vh - top - bottom) / ch);
+  const radians = panoXf.angle * Math.PI / 180;
+  const boundsWidth = Math.abs(cw * Math.cos(radians)) + Math.abs(ch * Math.sin(radians));
+  const boundsHeight = Math.abs(cw * Math.sin(radians)) + Math.abs(ch * Math.cos(radians));
+  const s = Math.min(vw / boundsWidth, (vh - top - bottom) / boundsHeight);
   panoXf.scale = s;
-  panoXf.x = (vw - cw * s) / 2;
-  panoXf.y = top + (vh - top - bottom - ch * s) / 2;
+  panoXf.x = vw / 2;
+  panoXf.y = top + (vh - top - bottom) / 2;
   applyPanoXf();
 }
 
@@ -1204,14 +1223,17 @@ panoView.addEventListener('pointermove', (e) => {
   } else if (panoPointers.size === 2) {
     const [a, b] = [...panoPointers.values()];
     const dist = Math.hypot(a.x - b.x, a.y - b.y);
+    const angle = Math.atan2(b.y - a.y, b.x - a.x);
     const r = panoView.getBoundingClientRect();
     const mx = (a.x + b.x) / 2 - r.left, my = (a.y + b.y) / 2 - r.top;
     if (panoPinch) {
       panoXf.x += mx - panoPinch.mx;
       panoXf.y += my - panoPinch.my;
-      zoomPanoAt(mx, my, dist / panoPinch.dist);
+      const turn = Math.atan2(Math.sin(angle - panoPinch.angle), Math.cos(angle - panoPinch.angle));
+      panoXf.angle = (panoXf.angle + turn * 180 / Math.PI + 360) % 360;
+      zoomPanoAt(mx, my, panoPinch.dist > 8 ? dist / panoPinch.dist : 1);
     }
-    panoPinch = {dist, mx, my};
+    panoPinch = {dist, mx, my, angle};
   }
 });
 ['pointerup', 'pointercancel'].forEach(evt => panoView.addEventListener(evt, (e) => {
@@ -1220,6 +1242,17 @@ panoView.addEventListener('pointermove', (e) => {
   if (panoPointers.size === 0) panoView.classList.remove('dragging');
 }));
 panoView.addEventListener('dblclick', fitPanoramic);
+
+function rotateProjection(degrees){
+  if (currentMode === 'slices') return;
+  panoXf.angle = (panoXf.angle + degrees + 360) % 360;
+  fitPanoramic();
+}
+
+$('projectionZoomOut').addEventListener('click', () => zoomPanoAt(panoView.clientWidth / 2, panoView.clientHeight / 2, 0.8));
+$('projectionZoomIn').addEventListener('click', () => zoomPanoAt(panoView.clientWidth / 2, panoView.clientHeight / 2, 1.25));
+$('projectionRotateLeft').addEventListener('click', () => rotateProjection(-90));
+$('projectionRotateRight').addEventListener('click', () => rotateProjection(90));
 
 new ResizeObserver(() => { if (currentMode !== 'slices') fitPanoramic(); }).observe(panoView);
 
@@ -1239,11 +1272,16 @@ $('panoDownloadBtn').addEventListener('click', () => {
   if (!pano) return;
   // export with square pixels so the image is not squashed
   const out = document.createElement('canvas');
-  out.width = pano.image.width;
-  out.height = Math.round(pano.image.height * pano.image.pixelMm[1] / pano.image.pixelMm[0]);
+  const width = pano.image.width;
+  const height = Math.round(pano.image.height * pano.image.pixelMm[1] / pano.image.pixelMm[0]);
+  const radians = panoXf.angle * Math.PI / 180;
+  out.width = Math.ceil(Math.abs(width * Math.cos(radians)) + Math.abs(height * Math.sin(radians)) - 1e-9);
+  out.height = Math.ceil(Math.abs(width * Math.sin(radians)) + Math.abs(height * Math.cos(radians)) - 1e-9);
   const ctx = out.getContext('2d');
   ctx.imageSmoothingQuality = 'high';
-  ctx.drawImage(panoCanvas, 0, 0, out.width, out.height);
+  ctx.translate(out.width / 2, out.height / 2);
+  ctx.rotate(radians);
+  ctx.drawImage(panoCanvas, -width / 2, -height / 2, width, height);
   out.toBlob((blob) => {
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
@@ -1365,7 +1403,10 @@ $('resetToolBtn').addEventListener('click', () => app.resetZoomPan());
 $('btnWL').addEventListener('click', () => applyTool('WindowLevel'));
 $('btnZoom').addEventListener('click', () => applyTool('ZoomAndPan'));
 $('btnScroll').addEventListener('click', () => applyTool('Scroll'));
-$('btnReset').addEventListener('click', () => currentMode !== 'slices' ? fitPanoramic() : app.resetZoomPan());
+$('btnReset').addEventListener('click', () => {
+  if (currentMode === 'slices') app.resetZoomPan();
+  else { panoXf.angle = 0; fitPanoramic(); }
+});
 $('btnFit').addEventListener('click', () => currentMode !== 'slices' ? fitPanoramic() : app.resetZoomPan());
 $('btnInfoMobile').addEventListener('click', toggleMobilePanel);
 panelCloseBtn.addEventListener('click', closeMobilePanel);
