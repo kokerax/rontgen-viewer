@@ -236,7 +236,8 @@ export async function scanDicomFiles(files, onProgress, options = {}){
       s.slices.push({
         ipp, iop, f,
         rowSpacing: spacing[0], colSpacing: spacing[1],
-        data: ds.data, width: ds.width, height: ds.height
+        data: ds.data, width: ds.width, height: ds.height,
+        source: {file, rows, cols, f, rowSpacing: spacing[0], colSpacing: spacing[1], slope, intercept, positionZ: ipp[2]}
       });
     } else {
       s.canVolume = false;
@@ -318,6 +319,7 @@ function buildVolume(slices){
     sx, sy, sz: dz * step,
     // data[z] ordered inferior -> superior
     data: kept.map(s => s.data),
+    sources: sorted.map(s => s.source),
     // +1 when increasing column index goes towards the patient's left
     rowDirX: Math.sign(r0) || 1
   };
@@ -433,7 +435,7 @@ function solve3(M, v){
 // Samples the arch curve at even arc-length steps (one in-plane voxel).
 // Returns points ordered from the patient's right to the patient's left,
 // with unit normals pointing to the outer (buccal) side of the arch.
-function archCurve(vol, arch){
+function archCurve(vol, arch, outputStepMm){
   const dense = [];
   const N = 4000;
   for (let i = 0; i <= N; i++) {
@@ -449,7 +451,7 @@ function archCurve(vol, arch){
     cum.push(cum[i - 1] + Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]));
   }
   const L = cum[cum.length - 1];
-  const stepMm = Math.min(vol.sx, vol.sz);
+  const stepMm = outputStepMm || Math.min(vol.sx, vol.sz);
   const n = Math.max(2, Math.floor(L / stepMm));
   const out = [];
   let j = 0;
@@ -502,7 +504,7 @@ function paddingValue(vol){
 // Builds the panoramic image: for each point of the arch and each slice,
 // the mean value through a slab of `thicknessMm` across the arch,
 // optionally shifted buccally (+) or lingually (-) by `shiftMm`.
-export function computePanoramic(vol, arch, {thicknessMm = 20, shiftMm = 0} = {}){
+export function computePanoramic(vol, arch, {thicknessMm = 12, shiftMm = 0} = {}){
   const curve = archCurve(vol, arch);
   if (!curve) return null;
   const pts = curve.points;
@@ -562,6 +564,82 @@ export function computePanoramic(vol, arch, {thicknessMm = 20, shiftMm = 0} = {}
     pixelMm: [curve.stepMm, vol.sz],
     lo, hi
   };
+}
+
+// Re-read each native DICOM slice only after the low-memory panorama is
+// visible. Sampling the arch at source pixel spacing raises detail without
+// keeping the full CBCT volume in mobile Safari memory.
+export async function computeDetailedPanoramic(vol, arch,
+  {thicknessMm = 12, shiftMm = 0, onProgress, cancelled} = {}){
+  const sources = vol.sources;
+  if (!sources || sources.length < MIN_VOLUME_SLICES) return null;
+  const first = sources[0];
+  if (!(first.rows > 1 && first.cols > 1 && first.rowSpacing > 0 && first.colSpacing > 0)) return null;
+  if (!sources.every(s => s.rows === first.rows && s.cols === first.cols &&
+      s.rowSpacing === first.rowSpacing && s.colSpacing === first.colSpacing)) return null;
+  const curve = archCurve(vol, arch, first.colSpacing);
+  if (!curve || curve.points.length > 2500) return null;
+  const width = curve.points.length, height = sources.length;
+  const samples = Math.max(2, Math.min(32, Math.ceil(thicknessMm / first.colSpacing) + 1));
+  const px = new Float32Array(width * samples);
+  const py = new Float32Array(width * samples);
+  const xOffset = Math.floor(first.f / 2) * first.colSpacing;
+  const yOffset = Math.floor(first.f / 2) * first.rowSpacing;
+  for (let x = 0; x < width; x++) {
+    const p = curve.points[x];
+    for (let k = 0; k < samples; k++) {
+      const distance = shiftMm + (k / (samples - 1) - 0.5) * thicknessMm;
+      px[x * samples + k] = (p.x + xOffset + p.nx * distance) / first.colSpacing;
+      py[x * samples + k] = (p.y + yOffset + p.ny * distance) / first.rowSpacing;
+    }
+  }
+  const out = new Float32Array(width * height);
+  const histogram = new Uint32Array(65536);
+  const pad = paddingValue(vol);
+  let finite = 0;
+  for (let z = 0; z < height; z++) {
+    if (cancelled?.()) return null;
+    const source = sources[z];
+    const parser = new DicomParser();
+    parser.parse(await source.file.arrayBuffer());
+    const pixels = parser.getDicomElements()['7FE00010']?.value?.[0];
+    if (!pixels || pixels.length < source.rows * source.cols) return null;
+    const rawPad = pad === null ? null : (pad - source.intercept) / source.slope;
+    const row = (height - 1 - z) * width;
+    for (let x = 0; x < width; x++) {
+      let sum = 0, count = 0;
+      for (let k = 0; k < samples; k++) {
+        const sx = px[x * samples + k], sy = py[x * samples + k];
+        if (sx < 0 || sy < 0 || sx >= source.cols - 1 || sy >= source.rows - 1) continue;
+        const x0 = sx | 0, y0 = sy | 0;
+        const i = y0 * source.cols + x0;
+        if (rawPad !== null && (Math.abs(pixels[i] - rawPad) < 0.5 ||
+            Math.abs(pixels[i + 1] - rawPad) < 0.5 ||
+            Math.abs(pixels[i + source.cols] - rawPad) < 0.5 ||
+            Math.abs(pixels[i + source.cols + 1] - rawPad) < 0.5)) continue;
+        const fx = sx - x0, fy = sy - y0;
+        const value = (pixels[i] * (1 - fx) + pixels[i + 1] * fx) * (1 - fy) +
+          (pixels[i + source.cols] * (1 - fx) + pixels[i + source.cols + 1] * fx) * fy;
+        sum += value; count++;
+      }
+      const value = count ? sum / count * source.slope + source.intercept : NaN;
+      out[row + x] = value;
+      if (Number.isFinite(value)) {
+        histogram[Math.max(0, Math.min(65535, Math.round(value) + 32768))]++;
+        finite++;
+      }
+    }
+    if (z % 8 === 0 || z === height - 1) {
+      onProgress?.(z + 1, height);
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+  }
+  if (finite < width * height * 0.1) return null;
+  const lo = percentileFromHistogram(histogram, finite, 0.10);
+  const hi = Math.max(lo + 1, percentileFromHistogram(histogram, finite, 0.998));
+  const verticalMm = Math.abs(sources[height - 1].positionZ - first.positionZ) / (height - 1);
+  return {width, height, data: out, pixelMm: [curve.stepMm, verticalMm], lo, hi,
+    detailed: true};
 }
 
 // Renders panoramic values into RGBA with a linear window.

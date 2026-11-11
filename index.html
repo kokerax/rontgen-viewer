@@ -242,6 +242,12 @@
   }
   .pano-view .side-label.left{ left:12px; }
   .pano-view .side-label.right{ right:12px; }
+  .pano-render-status{
+    position:absolute; left:50%; bottom:80px; transform:translateX(-50%);
+    padding:6px 10px; border-radius:8px; white-space:nowrap;
+    color:var(--text); background:rgba(20,23,28,.88);
+    border:1px solid var(--border); font-size:11px; pointer-events:none;
+  }
   .volume-view{ flex:1 1 auto; position:relative; min-width:0; overflow:hidden;
     display:none; touch-action:none; cursor:grab; background:#040507; }
   .volume-view.dragging{ cursor:grabbing; }
@@ -412,6 +418,7 @@
       <canvas id="panoCanvas"></canvas>
       <span class="side-label left">SAĞ</span>
       <span class="side-label right">SOL</span>
+      <span id="panoRenderStatus" class="pano-render-status" role="status" aria-live="polite" style="display:none;"></span>
     </div>
     <div id="volumeView" class="volume-view" aria-label="Döndürülebilir 3D tomografi önizlemesi">
       <canvas id="volumeCanvas"></canvas>
@@ -472,15 +479,15 @@
         <input type="range" id="panoContrast" min="-100" max="100" value="0" step="1">
       </div>
       <div class="control pano-only">
-        <label for="panoThick"><span>Kesit kalınlığı</span><span id="panoThickVal">20 mm</span></label>
-        <input type="range" id="panoThick" min="2" max="40" value="20" step="1">
+        <label for="panoThick"><span>Kesit kalınlığı</span><span id="panoThickVal">12 mm</span></label>
+        <input type="range" id="panoThick" min="2" max="40" value="12" step="1">
       </div>
       <div class="control pano-only">
         <label for="panoShift"><span>Eğri konumu (dil ↔ yanak)</span><span id="panoShiftVal">0 mm</span></label>
         <input type="range" id="panoShift" min="-12" max="12" value="0" step="0.5">
       </div>
       <button class="btn block" id="panoDownloadBtn">⬇️ Panoramiği indir (PNG)</button>
-      <p class="panel-note" id="projectionNote">Panoramik, 3D tomografiden diş kavsi otomatik bulunarak oluşturulur; tanı için cihazın kendi yazılımındaki ölçümlerin yerini tutmaz.</p>
+      <p class="panel-note" id="projectionNote">Diş kavsi boyunca CBCT kesitlerinden oluşturulur. Ayrı çekilmiş panoramik röntgen değildir; tanı ve ölçüm için cihaz yazılımını kullanın.</p>
     </div>
     <div class="panel-section" id="volumeSection" style="display:none;">
       <h3>3D görünüm</h3>
@@ -549,8 +556,8 @@ import {
   App, AppOptions, ViewConfig, ToolConfig, Index, getDwvVersion
 } from "dwv";
 import {
-  scanDicomFiles, isIgnoredFile, sniffDicom, normalizeDicomFile, detectArch, computePanoramic, renderPanoramic
-} from "./pano.js?v=combined-5";
+  scanDicomFiles, isIgnoredFile, sniffDicom, normalizeDicomFile, detectArch, computePanoramic, computeDetailedPanoramic, renderPanoramic
+} from "./pano.js?v=combined-6";
 import {isZipFile, extractZip} from "./zip.js";
 import {packVolumeLayers, previewFromVolume, createVolumeViewer} from "./volume3d.js?v=1";
 
@@ -585,6 +592,7 @@ const mobileSlicePrev = $('mobileSlicePrev');
 const mobileSliceNext = $('mobileSliceNext');
 const panoView = $('panoView');
 const panoCanvas = $('panoCanvas');
+const panoRenderStatus = $('panoRenderStatus');
 const panoSection = $('panoSection');
 const volumeView = $('volumeView');
 const volumeCanvas = $('volumeCanvas');
@@ -643,6 +651,7 @@ function enterViewer(){
 
 function backToDropzone(){
   loadToken++;
+  panoDetailToken++;
   volumeViewer?.clear();
   mobileSliceToken++;
   mobileSliceFiles = null;
@@ -787,6 +796,7 @@ const mobileDevice = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) ||
 
 async function loadFiles(fileList){
   const picked = Array.from(fileList);
+  panoDetailToken++;
   volumeViewer?.clear();
   const zips = picked.filter(isZipFile);
   let files = picked.filter(f => !isZipFile(f) && !isIgnoredFile(f));
@@ -886,6 +896,8 @@ function buildSeriesUI(series){
 }
 
 async function openSeries(s){
+  panoDetailToken++;
+  if (pano?.mode === 'pano' && !pano.image?.detailed) pano = null;
   if (currentSeries && currentSeries !== s) volumeViewer?.clear();
   if (s.deferVolume) {
     const token = loadToken;
@@ -1120,6 +1132,11 @@ async function buildDecodedOverview(series, targetMode = 'overview'){
 }
 
 function setMode(mode, filesOverride){
+  if (mode !== 'pano') {
+    panoDetailToken++;
+    panoRenderStatus.style.display = 'none';
+    if (pano?.mode === 'pano' && !pano.image?.detailed) pano = null;
+  }
   if (mode === 'pano' && currentSeries && !currentSeries.arch) {
     showError('Bu seride otomatik diş kavsi bulunamadı. CBCT klasörünün tamamını veya başka bir seriyi açın.');
     return;
@@ -1194,6 +1211,7 @@ modeTabs.querySelectorAll('button').forEach(b => {
 
 // ---------- panoramic view ----------
 let pano = null;           // {series, image, thickness, shift}
+let panoDetailToken = 0;
 const panoCtx = panoCanvas.getContext('2d');
 const panoXf = {scale: 1, x: 0, y: 0, angle: 0};
 
@@ -1208,7 +1226,7 @@ function showPanoramic(){
   $('projectionTitle').textContent = isOverview ? 'Birleşik görünüm' : 'Panoramik';
   $('projectionNote').textContent = isOverview
     ? `${s.overviewSampled && s.overviewSampled < s.overviewTotal ? `${s.overviewTotal} kesitten ${s.overviewSampled} tanesi örneklendi. ` : ''}${s.overviewSkipped ? `${s.overviewSkipped} seçili kesit okunamadı. ` : ''}En yoğun noktalar üst üste gösterilir. Bu 2D önizlemedir; 3D model veya tanı görüntüsü değildir.`
-    : 'Panoramik, 3D tomografiden diş kavsi otomatik bulunarak oluşturulur; tanı için cihazın kendi yazılımındaki ölçümlerin yerini tutmaz.';
+    : 'Diş kavsi boyunca CBCT kesitlerinden oluşturulur. Ayrı çekilmiş panoramik röntgen değildir; tanı ve ölçüm için cihaz yazılımını kullanın.';
   $('panoDownloadBtn').textContent = isOverview ? '⬇️ Birleşik görünümü indir (PNG)' : '⬇️ Panoramiği indir (PNG)';
   const params = panoParams();
   const sameParams = pano && pano.series === s && pano.mode === currentMode &&
@@ -1231,19 +1249,53 @@ function showPanoramic(){
     if (!isOverview) modeTabs.querySelector('[data-mode="pano"]').classList.remove('unavailable');
     const fresh = !pano || pano.series !== s || pano.mode !== currentMode;
     pano = {series: s, mode: currentMode, image, ...params};
-    panoCanvas.width = image.width;
-    panoCanvas.height = image.height;
-    // pixels are not square in mm: stretch the canvas, not the data
-    panoCanvas.style.width = image.width + 'px';
-    panoCanvas.style.height = (image.height * image.pixelMm[1] / image.pixelMm[0]) + 'px';
-    drawPanoramic();
-    if (fresh) {
-      panoXf.angle = 0;
-      requestAnimationFrame(fitPanoramic);
-    }
+    presentPanoramicImage(image, fresh);
+    if (!isOverview && s.volume?.sources?.length) startDetailedPanoramic(s, params);
   } else {
     requestAnimationFrame(fitPanoramic);
   }
+}
+
+function presentPanoramicImage(image, fit){
+  pano.image = image;
+  panoCanvas.width = image.width;
+  panoCanvas.height = image.height;
+  // Pixel spacing differs along and across the dental arch.
+  panoCanvas.style.width = image.width + 'px';
+  panoCanvas.style.height = (image.height * image.pixelMm[1] / image.pixelMm[0]) + 'px';
+  drawPanoramic();
+  if (fit) {
+    panoXf.angle = 0;
+    requestAnimationFrame(fitPanoramic);
+  }
+}
+
+function startDetailedPanoramic(series, params){
+  const token = ++panoDetailToken;
+  panoRenderStatus.textContent = 'Panoramik netleştiriliyor…';
+  panoRenderStatus.style.display = 'block';
+  requestAnimationFrame(async () => {
+    try {
+      const image = await computeDetailedPanoramic(series.volume, series.arch, {
+        ...params,
+        cancelled: () => token !== panoDetailToken || currentSeries !== series || currentMode !== 'pano',
+        onProgress: (done, total) => {
+          if (token === panoDetailToken) panoRenderStatus.textContent = `Panoramik netleştiriliyor… %${Math.round(done / total * 100)}`;
+        }
+      });
+      if (token !== panoDetailToken || currentSeries !== series || currentMode !== 'pano') return;
+      panoRenderStatus.style.display = 'none';
+      if (!image) return;
+      const previousWidth = parseFloat(panoCanvas.style.width) || image.width;
+      presentPanoramicImage(image, false);
+      panoXf.scale *= previousWidth / image.width;
+      applyPanoXf();
+      $('projectionNote').textContent = 'Kaynak CBCT kesitlerinden daha net panoramik görünüm üretildi. Ayrı çekilmiş panoramik röntgen değildir; tanı ve ölçüm için cihaz yazılımını kullanın.';
+    } catch (err) {
+      if (token === panoDetailToken) panoRenderStatus.style.display = 'none';
+      console.warn('detailed panoramic unavailable', err?.name || 'Error');
+    }
+  });
 }
 
 function panoWindow(){
