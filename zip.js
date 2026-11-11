@@ -116,6 +116,9 @@ export async function extractZip(zip, onProgress, options = {}){
   const inflated = entries.reduce((sum, en) => sum +
     (en.method === 8 && !(options.skipName && options.skipName(en.name.split('/').pop())) ? en.size : 0), 0);
   const lazyDeflate = !!(options.maxInflatedBytes && inflated > options.maxInflatedBytes);
+  const stored = entries.reduce((sum, en) => sum +
+    (en.method === 0 && !(options.skipName && options.skipName(en.name.split('/').pop())) ? en.size : 0), 0);
+  const lazyStored = !!(options.maxInflatedBytes && stored > options.maxInflatedBytes);
 
   const out = [];
   for (let i = 0; i < entries.length; i++) {
@@ -130,6 +133,18 @@ export async function extractZip(zip, onProgress, options = {}){
     const raw = zip.slice(dataStart, dataStart + en.compSize);
     let blob;
     if (en.method === 0) {
+      if (lazyStored) {
+        // On mobile WebKit, wrapping every slice in a File can retain the
+        // entire multi-gigabyte archive. Keep only archive offsets instead.
+        out.push({
+          name: base, size: en.size, relativePath: en.name,
+          arrayBuffer: () => zip.slice(dataStart, dataStart + en.size).arrayBuffer(),
+          slice(start = 0, end = en.size) {
+            return zip.slice(dataStart + start, dataStart + end);
+          }
+        });
+        continue;
+      }
       blob = raw;
     } else if (en.method === 8) {
       if (typeof DecompressionStream === 'undefined') throw new Error('zip: no DecompressionStream');
