@@ -516,7 +516,7 @@ import {
 } from "dwv";
 import {
   scanDicomFiles, isIgnoredFile, sniffDicom, normalizeDicomFile, detectArch, computePanoramic, renderPanoramic
-} from "./pano.js?v=combined-2";
+} from "./pano.js?v=combined-4";
 import {isZipFile, extractZip} from "./zip.js";
 
 // ---------- DOM refs ----------
@@ -581,6 +581,7 @@ let currentToolName = 'WindowLevel';
 let hasData = false;
 let currentDataId = null;
 let nLoadErrors = 0;
+let buildingOverview = false;
 
 function showError(msg){
   errorToast.textContent = msg;
@@ -639,12 +640,14 @@ app.addEventListener('loadstart', () => {
 });
 
 app.addEventListener('loadprogress', (e) => {
+  if (buildingOverview) return;
   const v = typeof e.loaded === 'number' ? e.loaded : null;
   setLoading(true, v !== null ? `Yükleniyor… %${Math.round(v)}` : 'Yükleniyor…');
 });
 
 let isFirstRender = true;
 app.addEventListener('renderend', (event) => {
+  if (buildingOverview) return;
   if (!isFirstRender) return;
   isFirstRender = false;
   currentDataId = event.dataid;
@@ -665,6 +668,7 @@ app.addEventListener('renderend', (event) => {
 });
 
 app.addEventListener('load', (event) => {
+  if (buildingOverview) return;
   setLoading(false);
   hasData = true;
   isFirstRender = true;
@@ -695,15 +699,18 @@ app.addEventListener('loaditem', (event) => {
 });
 
 app.addEventListener('loaderror', (event) => {
+  if (buildingOverview) return;
   nLoadErrors++;
   console.error('dwv load error', event.error);
 });
 
 app.addEventListener('loadabort', () => {
+  if (buildingOverview) return;
   showError('Yükleme iptal edildi.');
 });
 
 app.addEventListener('loadend', () => {
+  if (buildingOverview) return;
   setLoading(false);
   if (nLoadErrors > 0) {
     showError('Dosya açılamadı. Bu dosyanın geçerli bir DICOM (röntgen) dosyası olduğundan emin olun.');
@@ -872,13 +879,18 @@ async function openSeries(s){
     setMode(s.arch ? 'pano' : 'overview');
     return;
   }
-  modeTabs.classList.remove('show');
+  modeTabs.querySelector('[data-mode="pano"]').style.display = 'none';
+  modeTabs.querySelector('[data-mode="overview"]').style.display = '';
+  modeTabs.classList.toggle('show', s.files.length > 1);
   setMode('slices');
 }
 
 function showSlicesForFiles(files){
+  currentSeries = {files, overview: null, arch: null};
   fileNameLabel.textContent = files.length === 1 ? files[0].name : `${files.length} dosya (seri)`;
-  modeTabs.classList.remove('show');
+  modeTabs.querySelector('[data-mode="pano"]').style.display = 'none';
+  modeTabs.querySelector('[data-mode="overview"]').style.display = '';
+  modeTabs.classList.toggle('show', files.length > 1);
   setMode('slices', files);
 }
 
@@ -888,6 +900,7 @@ let slicesLoadedFor = null;
 let mobileSliceFiles = null;
 let mobileSliceIndex = 0;
 let mobileSliceToken = 0;
+let overviewBuildPromise = null;
 
 async function loadMobileSlice(index){
   if (!mobileSliceFiles || index < 0 || index >= mobileSliceFiles.length) return;
@@ -917,7 +930,98 @@ async function loadMobileSlice(index){
 mobileSlicePrev.addEventListener('click', () => loadMobileSlice(mobileSliceIndex - 1));
 mobileSliceNext.addEventListener('click', () => loadMobileSlice(mobileSliceIndex + 1));
 
+async function buildDecodedOverview(series){
+  if (overviewBuildPromise) return overviewBuildPromise;
+  const token = loadToken;
+  overviewBuildPromise = (async () => {
+    buildingOverview = true;
+    mobileSliceToken++;
+    mobileSliceNav.classList.remove('show');
+    let projection = null;
+    let decoded = 0;
+    let skipped = 0;
+    try {
+      for (let index = 0; index < series.files.length; index++) {
+        if (token !== loadToken || currentSeries !== series) return;
+        setLoading(true, `Birleşik görünüm hazırlanıyor… ${index + 1}/${series.files.length}`);
+        try {
+          const normalized = await normalizeDicomFile(series.files[index]);
+          if (!normalized || normalized.size > 180 * 1024 * 1024) { skipped++; continue; }
+          const file = normalized instanceof Blob ? normalized :
+            new File([await normalized.arrayBuffer()], normalized.name);
+          app.reset();
+          const dataId = await new Promise((resolve, reject) => {
+            const cleanup = () => {
+              clearTimeout(timer);
+              app.removeEventListener('load', onLoad);
+              app.removeEventListener('loaderror', onError);
+              app.removeEventListener('loadabort', onAbort);
+            };
+            const onLoad = event => { cleanup(); resolve(event.dataid); };
+            const onError = () => { cleanup(); reject(new Error('decode failed')); };
+            const onAbort = () => { cleanup(); reject(new Error('decode aborted')); };
+            const timer = setTimeout(() => { cleanup(); reject(new Error('decode timeout')); }, 45000);
+            app.addEventListener('load', onLoad);
+            app.addEventListener('loaderror', onError);
+            app.addEventListener('loadabort', onAbort);
+            try { app.loadFiles([file]); }
+            catch (err) { cleanup(); reject(err); }
+          });
+          const image = app.getImage(dataId);
+          if (!image || image.getNumberOfComponents() !== 1) { skipped++; continue; }
+          const size = image.getGeometry().getSize();
+          const width = size.get(0), height = size.get(1);
+          const buffer = image.getBuffer();
+          const step = Math.max(1, Math.ceil(Math.max(width, height) / 160));
+          const outWidth = Math.floor(width / step), outHeight = Math.floor(height / step);
+          if (!outWidth || !outHeight || buffer.length < width * height) { skipped++; continue; }
+          if (!projection) {
+            projection = {data: new Int16Array(outWidth * outHeight).fill(-32768),
+              width: outWidth, height: outHeight, pixelMm: [1, 1]};
+          }
+          if (projection.width !== outWidth || projection.height !== outHeight) { skipped++; continue; }
+          for (let y = 0; y < outHeight; y++) {
+            const row = (y * step + Math.floor(step / 2)) * width;
+            for (let x = 0; x < outWidth; x++) {
+              const i = y * outWidth + x;
+              const value = buffer[row + x * step + Math.floor(step / 2)];
+              if (Number.isFinite(value) && value > projection.data[i]) {
+                projection.data[i] = Math.max(-32768, Math.min(32767, value));
+              }
+            }
+          }
+          decoded++;
+        } catch (err) {
+          skipped++;
+        }
+      }
+      if (token !== loadToken || currentSeries !== series) return;
+      if (!projection || decoded < 2) throw new Error('not enough decodable slices');
+      const sorted = Array.from(projection.data).sort((a, b) => a - b);
+      projection.lo = sorted[Math.floor(sorted.length * 0.01)];
+      projection.hi = Math.max(projection.lo + 1, sorted[Math.floor(sorted.length * 0.995)]);
+      series.overview = projection;
+      series.overviewSkipped = skipped;
+      setMode('overview');
+    } catch (err) {
+      if (token === loadToken && currentSeries === series) {
+        slicesLoadedFor = null;
+        setMode('slices');
+        showError('Birleşik görünüm bu DICOM serisinden oluşturulamadı.');
+      }
+    } finally {
+      buildingOverview = false;
+      if (token === loadToken && currentSeries === series && series.overview) setLoading(false);
+    }
+  })().finally(() => { overviewBuildPromise = null; });
+  return overviewBuildPromise;
+}
+
 function setMode(mode, filesOverride){
+  if (mode === 'overview' && currentSeries && !currentSeries.overview) {
+    buildDecodedOverview(currentSeries);
+    return;
+  }
   const files = filesOverride || (currentSeries && currentSeries.files);
   const mobilePreview = mode === 'slices' && mobileDevice && files &&
     (files.length > 100 || files.reduce((sum, file) => sum + file.size, 0) > 180 * 1024 * 1024);
@@ -975,7 +1079,7 @@ function showPanoramic(){
   const isOverview = currentMode === 'overview';
   $('projectionTitle').textContent = isOverview ? 'Birleşik görünüm' : 'Panoramik';
   $('projectionNote').textContent = isOverview
-    ? 'Tüm kesitlerin en yoğun noktaları üst üste gösterilir. Bu 2D genel bakıştır; 3D model veya tanı görüntüsü değildir.'
+    ? `${s.overviewSkipped ? `${s.overviewSkipped} kesit okunamadı. ` : ''}Okunabilen kesitlerin en yoğun noktaları üst üste gösterilir. Bu 2D genel bakıştır; 3D model veya tanı görüntüsü değildir.`
     : 'Panoramik, 3D tomografiden diş kavsi otomatik bulunarak oluşturulur; tanı için cihazın kendi yazılımındaki ölçümlerin yerini tutmaz.';
   $('panoDownloadBtn').textContent = isOverview ? '⬇️ Birleşik görünümü indir (PNG)' : '⬇️ Panoramiği indir (PNG)';
   const params = panoParams();

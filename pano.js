@@ -192,6 +192,9 @@ export async function scanDicomFiles(files, onProgress, options = {}){
         files: [],
         slices: [],
         canVolume: true,
+        canOverview: true,
+        overview: null,
+        overviewCount: 0,
         deferVolume: !!(options.mobile && options.firstVolumeOnly && seriesMap.size > 0)
       };
       seriesMap.set(uid, s);
@@ -199,7 +202,7 @@ export async function scanDicomFiles(files, onProgress, options = {}){
     s.files.push(file);
 
     if (s.deferVolume) continue;
-    if (!s.canVolume) continue;
+    if (!s.canOverview && !s.canVolume) continue;
     const ts = str(elements, '00020010');
     const rows = Number(first(elements, '00280010'));
     const cols = Number(first(elements, '00280011'));
@@ -208,56 +211,85 @@ export async function scanDicomFiles(files, onProgress, options = {}){
     const iop = nums(elements, '00200037');
     const spacing = nums(elements, '00280030');
     const spp = Number(first(elements, '00280002') || 1);
-    if (!NATIVE_TS.has(ts) || nFrames !== 1 || spp !== 1 ||
-        !ipp || !iop || iop.length !== 6 || !spacing || !rows || !cols) {
+    if (!NATIVE_TS.has(ts) || nFrames !== 1 || spp !== 1 || !rows || !cols) {
       s.canVolume = false;
+      s.canOverview = false;
+      s.overview = null;
       s.slices = [];
       continue;
     }
     const pixels = elements['7FE00010'].value[0];
-    if (!pixels || pixels.length < rows * cols) { s.canVolume = false; s.slices = []; continue; }
+    if (!pixels || pixels.length < rows * cols) {
+      s.canVolume = false;
+      s.canOverview = false;
+      s.overview = null;
+      s.slices = [];
+      continue;
+    }
 
     const f = Math.max(1, Math.ceil(Math.max(rows, cols) / (options.mobile ? 160 : TARGET_SIDE)));
     const slope = Number(str(elements, '00281053') || 1) || 1;
     const intercept = Number(str(elements, '00281052') || 0) || 0;
     const ds = downsampleFrame(pixels, rows, cols, f, slope, intercept, !!options.mobile);
-    s.slices.push({
-      ipp, iop, f,
-      rowSpacing: spacing[0], colSpacing: spacing[1],
-      data: ds.data, width: ds.width, height: ds.height
-    });
+    if (s.canOverview) updateOverview(s, ds, iop, spacing, f);
+    if (s.canVolume && ipp && iop && iop.length === 6 && spacing) {
+      s.slices.push({
+        ipp, iop, f,
+        rowSpacing: spacing[0], colSpacing: spacing[1],
+        data: ds.data, width: ds.width, height: ds.height
+      });
+    } else {
+      s.canVolume = false;
+      s.slices = [];
+    }
   }
 
   const series = [];
   for (const s of seriesMap.values()) {
-    s.overview = s.canVolume ? buildOverview(s.slices) : null;
+    s.overview = s.canOverview ? finishOverview(s.overview, s.overviewCount) : null;
     s.volume = s.canVolume ? buildVolume(s.slices) : null;
     delete s.slices;
+    delete s.canOverview;
+    delete s.overviewCount;
     series.push(s);
   }
   series.sort((a, b) => b.files.length - a.files.length);
   return {series, skipped};
 }
 
-// A small maximum-intensity projection of the complete stack. Unlike the
-// dental panorama it also works when an axial volume or arch cannot be made.
-export function buildOverview(slices){
-  if (slices.length < 2) return null;
-  const first = slices[0];
-  if (!slices.every(s => s.width === first.width && s.height === first.height &&
-      s.iop.every((v, i) => Math.abs(v - first.iop[i]) < 1e-3))) return null;
-  const data = new Int16Array(first.width * first.height).fill(-32768);
-  for (const slice of slices) {
-    for (let i = 0; i < data.length; i++) data[i] = Math.max(data[i], slice.data[i]);
+// Accumulate a small maximum-intensity projection without retaining all
+// slices. This needs pixel frames, but not the position/orientation tags
+// required by the dental panorama.
+function updateOverview(series, frame, iop, spacing, f){
+  const current = series.overview;
+  if (!current) {
+    series.overview = {
+      data: new Int16Array(frame.data), width: frame.width, height: frame.height,
+      pixelMm: [spacing?.[1] * f || 1, spacing?.[0] * f || 1],
+      iop: iop?.length === 6 ? iop : null
+    };
+  } else {
+    if (current.width !== frame.width || current.height !== frame.height ||
+        (current.iop && iop?.length === 6 &&
+          iop.some((v, i) => Math.abs(v - current.iop[i]) > 1e-3))) {
+      series.canOverview = false;
+      series.overview = null;
+      return;
+    }
+    for (let i = 0; i < current.data.length; i++) {
+      current.data[i] = Math.max(current.data[i], frame.data[i]);
+    }
   }
-  const sorted = Array.from(data).sort((a, b) => a - b);
+  series.overviewCount++;
+}
+
+function finishOverview(overview, count){
+  if (!overview || count < 2) return null;
+  const sorted = Array.from(overview.data).sort((a, b) => a - b);
   const lo = sorted[Math.floor(sorted.length * 0.01)];
   const hi = sorted[Math.floor(sorted.length * 0.995)];
-  return {
-    data, width: first.width, height: first.height,
-    pixelMm: [first.colSpacing * first.f, first.rowSpacing * first.f],
-    lo, hi: Math.max(lo + 1, hi)
-  };
+  const {iop, ...image} = overview;
+  return {...image, lo, hi: Math.max(lo + 1, hi)};
 }
 
 // Stacks axial slices into a volume. Slices are kept at their native
