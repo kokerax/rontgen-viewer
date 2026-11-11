@@ -15,6 +15,7 @@ const NATIVE_TS = new Set([
   '1.2.840.10008.1.2.1',   // explicit little endian
   '1.2.840.10008.1.2.1.99' // deflated explicit little endian (inflated by parser)
 ]);
+const JPEG_LOSSLESS_TS = '1.2.840.10008.1.2.4.70';
 
 // keep the downsampled volume around this many voxels per side
 const TARGET_SIDE = 420;
@@ -152,12 +153,39 @@ function downsampleFrame(px, rows, cols, f, slope, intercept, fast = false){
   return {data: out, width: ow, height: oh};
 }
 
+// DWV already ships this decoder for its slice viewer. Reuse its worker so
+// compressed frames are decoded one at a time, outside the UI thread.
+function createJpegLosslessDecoder(){
+  const worker = new Worker(new URL('./assets/workers/jpegloss.worker.min.js', import.meta.url));
+  return {
+    decode(bytes, bitsAllocated, isSigned){
+      if (!(bytes instanceof Uint8Array) || bytes[0] !== 0xff || bytes[1] !== 0xd8 ||
+          ![8, 16].includes(bitsAllocated)) return Promise.reject(new Error('unsupported JPEG Lossless frame'));
+      const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+      return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => { cleanup(); reject(new Error('JPEG Lossless decode timeout')); }, 30000);
+        const cleanup = () => {
+          clearTimeout(timeout);
+          worker.onmessage = null;
+          worker.onerror = null;
+        };
+        worker.onmessage = event => { cleanup(); resolve(event.data?.[0]); };
+        worker.onerror = () => { cleanup(); reject(new Error('JPEG Lossless decode failed')); };
+        worker.postMessage({buffer, meta: {bitsAllocated, isSigned}}, [buffer]);
+      });
+    },
+    terminate(){ worker.terminate(); }
+  };
+}
+
 // Reads and parses every file once. Returns the DICOM series found, each
-// with its files and, for uncompressed single-frame stacks, the
+// with its files and, for supported single-frame axial stacks, the
 // downsampled pixel slices needed for the panoramic reconstruction.
 export async function scanDicomFiles(files, onProgress, options = {}){
   const seriesMap = new Map();
   let skipped = 0;
+  let jpegDecoder = null;
+  try {
   for (let i = 0; i < files.length; i++) {
     let file = files[i];
     if (i % (options.mobile ? 2 : 10) === 0 || i === files.length - 1) {
@@ -211,14 +239,23 @@ export async function scanDicomFiles(files, onProgress, options = {}){
     const iop = nums(elements, '00200037');
     const spacing = nums(elements, '00280030');
     const spp = Number(first(elements, '00280002') || 1);
-    if (!NATIVE_TS.has(ts) || nFrames !== 1 || spp !== 1 || !rows || !cols) {
+    const compressed = ts === JPEG_LOSSLESS_TS;
+    if ((!NATIVE_TS.has(ts) && !compressed) || nFrames !== 1 || spp !== 1 || !rows || !cols) {
       s.canVolume = false;
       s.canOverview = false;
       s.overview = null;
       s.slices = [];
       continue;
     }
-    const pixels = elements['7FE00010'].value[0];
+    const bitsAllocated = Number(first(elements, '00280100'));
+    const isSigned = Number(first(elements, '00280103')) === 1;
+    let pixels = elements['7FE00010'].value[0];
+    if (compressed) {
+      try {
+        jpegDecoder ||= createJpegLosslessDecoder();
+        pixels = await jpegDecoder.decode(pixels, bitsAllocated, isSigned);
+      } catch (err) { pixels = null; }
+    }
     if (!pixels || pixels.length < rows * cols) {
       s.canVolume = false;
       s.canOverview = false;
@@ -237,12 +274,16 @@ export async function scanDicomFiles(files, onProgress, options = {}){
         ipp, iop, f,
         rowSpacing: spacing[0], colSpacing: spacing[1],
         data: ds.data, width: ds.width, height: ds.height,
-        source: {file, rows, cols, f, rowSpacing: spacing[0], colSpacing: spacing[1], slope, intercept, positionZ: ipp[2]}
+        source: {file, rows, cols, f, rowSpacing: spacing[0], colSpacing: spacing[1], slope, intercept,
+          positionZ: ipp[2], transferSyntax: ts, bitsAllocated, isSigned}
       });
     } else {
       s.canVolume = false;
       s.slices = [];
     }
+  }
+  } finally {
+    jpegDecoder?.terminate();
   }
 
   const series = [];
@@ -576,7 +617,8 @@ export async function computeDetailedPanoramic(vol, arch,
   const first = sources[0];
   if (!(first.rows > 1 && first.cols > 1 && first.rowSpacing > 0 && first.colSpacing > 0)) return null;
   if (!sources.every(s => s.rows === first.rows && s.cols === first.cols &&
-      s.rowSpacing === first.rowSpacing && s.colSpacing === first.colSpacing)) return null;
+      s.rowSpacing === first.rowSpacing && s.colSpacing === first.colSpacing &&
+      s.transferSyntax === first.transferSyntax)) return null;
   const curve = archCurve(vol, arch, first.colSpacing);
   if (!curve || curve.points.length > 2500) return null;
   const width = curve.points.length, height = sources.length;
@@ -597,12 +639,18 @@ export async function computeDetailedPanoramic(vol, arch,
   const histogram = new Uint32Array(65536);
   const pad = paddingValue(vol);
   let finite = 0;
+  const jpegDecoder = first.transferSyntax === JPEG_LOSSLESS_TS ? createJpegLosslessDecoder() : null;
+  try {
   for (let z = 0; z < height; z++) {
     if (cancelled?.()) return null;
     const source = sources[z];
     const parser = new DicomParser();
     parser.parse(await source.file.arrayBuffer());
-    const pixels = parser.getDicomElements()['7FE00010']?.value?.[0];
+    let pixels = parser.getDicomElements()['7FE00010']?.value?.[0];
+    if (source.transferSyntax === JPEG_LOSSLESS_TS) {
+      if (!jpegDecoder) return null;
+      pixels = await jpegDecoder.decode(pixels, source.bitsAllocated, source.isSigned);
+    }
     if (!pixels || pixels.length < source.rows * source.cols) return null;
     const rawPad = pad === null ? null : (pad - source.intercept) / source.slope;
     const row = (height - 1 - z) * width;
@@ -633,6 +681,9 @@ export async function computeDetailedPanoramic(vol, arch,
       onProgress?.(z + 1, height);
       await new Promise(resolve => setTimeout(resolve, 0));
     }
+  }
+  } finally {
+    jpegDecoder?.terminate();
   }
   if (finite < width * height * 0.1) return null;
   const lo = percentileFromHistogram(histogram, finite, 0.10);
