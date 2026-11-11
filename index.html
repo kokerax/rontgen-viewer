@@ -979,7 +979,9 @@ async function buildDecodedOverview(series){
           const size = image.getGeometry().getSize();
           const width = size.get(0), height = size.get(1);
           const buffer = image.getBuffer();
-          const step = Math.max(1, Math.ceil(Math.max(width, height) / 160));
+          // Keep the preview near the source resolution. Frame count, rather
+          // than output pixels, is the mobile decoder's memory limit.
+          const step = Math.max(1, Math.ceil(Math.max(width, height) / (mobileDevice ? 1024 : 1600)));
           const outWidth = Math.floor(width / step), outHeight = Math.floor(height / step);
           if (!outWidth || !outHeight || buffer.length < width * height) { skipped++; continue; }
           if (!projection) {
@@ -1004,9 +1006,19 @@ async function buildDecodedOverview(series){
       }
       if (token !== loadToken || currentSeries !== series) return;
       if (!projection || decoded < 2) throw new Error('not enough decodable slices');
-      const sorted = Array.from(projection.data).sort((a, b) => a - b);
-      projection.lo = sorted[Math.floor(sorted.length * 0.01)];
-      projection.hi = Math.max(projection.lo + 1, sorted[Math.floor(sorted.length * 0.995)]);
+      const histogram = new Uint32Array(65536);
+      for (const value of projection.data) histogram[value + 32768]++;
+      const percentile = fraction => {
+        const target = projection.data.length * fraction;
+        let seen = 0;
+        for (let i = 0; i < histogram.length; i++) {
+          seen += histogram[i];
+          if (seen >= target) return i - 32768;
+        }
+        return 32767;
+      };
+      projection.lo = percentile(0.01);
+      projection.hi = Math.max(projection.lo + 1, percentile(0.995));
       series.overview = projection;
       series.overviewSkipped = skipped;
       series.overviewSampled = decoded;
