@@ -516,7 +516,7 @@ import {
 } from "dwv";
 import {
   scanDicomFiles, isIgnoredFile, sniffDicom, normalizeDicomFile, detectArch, computePanoramic, renderPanoramic
-} from "./pano.js?v=combined-4";
+} from "./pano.js?v=combined-5";
 import {isZipFile, extractZip} from "./zip.js";
 
 // ---------- DOM refs ----------
@@ -937,13 +937,20 @@ async function buildDecodedOverview(series){
     buildingOverview = true;
     mobileSliceToken++;
     mobileSliceNav.classList.remove('show');
+    // DWV retains decoder/render allocations briefly after reset. On iOS,
+    // opening hundreds of full-resolution frames in one tab can reload it.
+    const maxFrames = mobileDevice ? 20 : 80;
+    const frameCount = Math.min(series.files.length, maxFrames);
+    const frameIndices = Array.from({length: frameCount}, (_, i) =>
+      Math.round(i * (series.files.length - 1) / Math.max(1, frameCount - 1)));
     let projection = null;
     let decoded = 0;
     let skipped = 0;
     try {
-      for (let index = 0; index < series.files.length; index++) {
+      for (let position = 0; position < frameIndices.length; position++) {
         if (token !== loadToken || currentSeries !== series) return;
-        setLoading(true, `Birleşik görünüm hazırlanıyor… ${index + 1}/${series.files.length}`);
+        const index = frameIndices[position];
+        setLoading(true, `Birleşik önizleme hazırlanıyor… ${position + 1}/${frameIndices.length}`);
         try {
           const normalized = await normalizeDicomFile(series.files[index]);
           if (!normalized || normalized.size > 180 * 1024 * 1024) { skipped++; continue; }
@@ -1002,6 +1009,8 @@ async function buildDecodedOverview(series){
       projection.hi = Math.max(projection.lo + 1, sorted[Math.floor(sorted.length * 0.995)]);
       series.overview = projection;
       series.overviewSkipped = skipped;
+      series.overviewSampled = decoded;
+      series.overviewTotal = series.files.length;
       setMode('overview');
     } catch (err) {
       if (token === loadToken && currentSeries === series) {
@@ -1079,7 +1088,7 @@ function showPanoramic(){
   const isOverview = currentMode === 'overview';
   $('projectionTitle').textContent = isOverview ? 'Birleşik görünüm' : 'Panoramik';
   $('projectionNote').textContent = isOverview
-    ? `${s.overviewSkipped ? `${s.overviewSkipped} kesit okunamadı. ` : ''}Okunabilen kesitlerin en yoğun noktaları üst üste gösterilir. Bu 2D genel bakıştır; 3D model veya tanı görüntüsü değildir.`
+    ? `${s.overviewSampled && s.overviewSampled < s.overviewTotal ? `${s.overviewTotal} kesitten ${s.overviewSampled} tanesi örneklendi. ` : ''}${s.overviewSkipped ? `${s.overviewSkipped} seçili kesit okunamadı. ` : ''}En yoğun noktalar üst üste gösterilir. Bu 2D önizlemedir; 3D model veya tanı görüntüsü değildir.`
     : 'Panoramik, 3D tomografiden diş kavsi otomatik bulunarak oluşturulur; tanı için cihazın kendi yazılımındaki ölçümlerin yerini tutmaz.';
   $('panoDownloadBtn').textContent = isOverview ? '⬇️ Birleşik görünümü indir (PNG)' : '⬇️ Panoramiği indir (PNG)';
   const params = panoParams();
