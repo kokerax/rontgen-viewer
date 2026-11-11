@@ -148,11 +148,13 @@ export async function extractZip(zip, onProgress, options = {}){
       blob = raw;
     } else if (en.method === 8) {
       if (typeof DecompressionStream === 'undefined') throw new Error('zip: no DecompressionStream');
+      const head = await inflateHead(raw, 132);
+      if (options.sniff && !options.sniff(head)) continue;
+      // Vendor archives also contain giant .vol/.pak companions. Check the
+      // limit only after sniffing, so non-DICOM data cannot block the images.
       if (options.maxInflatedBytes && en.size > options.maxInflatedBytes) {
         throw new Error('zip: mobile memory limit');
       }
-      const head = await inflateHead(raw, 132);
-      if (options.sniff && !options.sniff(head)) continue;
       if (lazyDeflate) {
         // A file-like view: inflate only the entry currently being scanned.
         // Keeping hundreds of inflated Blobs alive can terminate mobile Safari.
