@@ -242,6 +242,14 @@
   }
   .pano-view .side-label.left{ left:12px; }
   .pano-view .side-label.right{ right:12px; }
+  .volume-view{ flex:1 1 auto; position:relative; min-width:0; overflow:hidden;
+    display:none; touch-action:none; cursor:grab; background:#040507; }
+  .volume-view.dragging{ cursor:grabbing; }
+  .volume-view canvas{ display:block; width:100%; height:100%; }
+  .volume-hint{ position:absolute; left:50%; bottom:75px; transform:translateX(-50%);
+    width:max-content; max-width:calc(100% - 24px); padding:6px 10px; border-radius:8px;
+    background:rgba(20,23,28,.85); color:var(--text-dim); font-size:11px;
+    pointer-events:none; text-align:center; }
 
   #modeTabs{
     position:absolute; top:10px; left:50%; transform:translateX(-50%); z-index:13;
@@ -398,10 +406,15 @@
       <span class="side-label left">SAĞ</span>
       <span class="side-label right">SOL</span>
     </div>
+    <div id="volumeView" class="volume-view" aria-label="Döndürülebilir 3D tomografi önizlemesi">
+      <canvas id="volumeCanvas"></canvas>
+      <div class="volume-hint">Parmağınızla çevirin · İki parmakla yakınlaştırın</div>
+    </div>
 
     <div id="modeTabs">
       <button data-mode="pano">🦷 Panoramik</button>
       <button data-mode="overview">◈ Birleşik</button>
+      <button data-mode="volume">⬡ 3D</button>
       <button data-mode="slices">📑 Kesitler</button>
     </div>
     <div id="mobileSliceNav" aria-label="Kesitlerde gezin">
@@ -461,6 +474,14 @@
       </div>
       <button class="btn block" id="panoDownloadBtn">⬇️ Panoramiği indir (PNG)</button>
       <p class="panel-note" id="projectionNote">Panoramik, 3D tomografiden diş kavsi otomatik bulunarak oluşturulur; tanı için cihazın kendi yazılımındaki ölçümlerin yerini tutmaz.</p>
+    </div>
+    <div class="panel-section" id="volumeSection" style="display:none;">
+      <h3>3D görünüm</h3>
+      <div class="control">
+        <label for="volumeThreshold"><span>Görünen yoğunluk</span><span id="volumeThresholdVal">%58</span></label>
+        <input type="range" id="volumeThreshold" min="0.3" max="0.85" value="0.58" step="0.01">
+      </div>
+      <p class="panel-note" id="volumeNote">Kesitlerden oluşturulan örneklenmiş 3D önizlemedir; tanı ve ölçüm için cihaz yazılımındaki görüntüyü kullanın.</p>
     </div>
 
     <div class="panel-section" id="seriesSection" style="display:none;">
@@ -524,6 +545,7 @@ import {
   scanDicomFiles, isIgnoredFile, sniffDicom, normalizeDicomFile, detectArch, computePanoramic, renderPanoramic
 } from "./pano.js?v=combined-5";
 import {isZipFile, extractZip} from "./zip.js";
+import {packVolumeLayers, previewFromVolume, createVolumeViewer} from "./volume3d.js?v=1";
 
 // ---------- DOM refs ----------
 const $ = (id) => document.getElementById(id);
@@ -557,6 +579,10 @@ const mobileSliceNext = $('mobileSliceNext');
 const panoView = $('panoView');
 const panoCanvas = $('panoCanvas');
 const panoSection = $('panoSection');
+const volumeView = $('volumeView');
+const volumeCanvas = $('volumeCanvas');
+const volumeSection = $('volumeSection');
+const volumeThreshold = $('volumeThreshold');
 const seriesSection = $('seriesSection');
 const seriesList = $('seriesList');
 const panoBright = $('panoBright');
@@ -610,6 +636,7 @@ function enterViewer(){
 
 function backToDropzone(){
   loadToken++;
+  volumeViewer?.clear();
   mobileSliceToken++;
   mobileSliceFiles = null;
   mobileSliceNav.classList.remove('show');
@@ -753,6 +780,7 @@ const mobileDevice = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) ||
 
 async function loadFiles(fileList){
   const picked = Array.from(fileList);
+  volumeViewer?.clear();
   const zips = picked.filter(isZipFile);
   let files = picked.filter(f => !isZipFile(f) && !isIgnoredFile(f));
   if (files.length === 0 && zips.length === 0) {
@@ -851,6 +879,7 @@ function buildSeriesUI(series){
 }
 
 async function openSeries(s){
+  if (currentSeries && currentSeries !== s) volumeViewer?.clear();
   if (s.deferVolume) {
     const token = loadToken;
     setLoading(true, 'Seçilen seri hazırlanıyor…');
@@ -881,12 +910,14 @@ async function openSeries(s){
   if (s.arch || s.overview) {
     modeTabs.querySelector('[data-mode="pano"]').style.display = s.arch ? '' : 'none';
     modeTabs.querySelector('[data-mode="overview"]').style.display = s.overview ? '' : 'none';
+    modeTabs.querySelector('[data-mode="volume"]').style.display = s.files.length > 1 ? '' : 'none';
     modeTabs.classList.add('show');
     setMode(s.arch ? 'pano' : 'overview');
     return;
   }
   modeTabs.querySelector('[data-mode="pano"]').style.display = 'none';
   modeTabs.querySelector('[data-mode="overview"]').style.display = '';
+  modeTabs.querySelector('[data-mode="volume"]').style.display = s.files.length > 1 ? '' : 'none';
   modeTabs.classList.toggle('show', s.files.length > 1);
   setMode('slices');
 }
@@ -896,6 +927,7 @@ function showSlicesForFiles(files){
   fileNameLabel.textContent = files.length === 1 ? files[0].name : `${files.length} dosya (seri)`;
   modeTabs.querySelector('[data-mode="pano"]').style.display = 'none';
   modeTabs.querySelector('[data-mode="overview"]').style.display = '';
+  modeTabs.querySelector('[data-mode="volume"]').style.display = files.length > 1 ? '' : 'none';
   modeTabs.classList.toggle('show', files.length > 1);
   setMode('slices', files);
 }
@@ -907,6 +939,7 @@ let mobileSliceFiles = null;
 let mobileSliceIndex = 0;
 let mobileSliceToken = 0;
 let overviewBuildPromise = null;
+let volumeViewer = null;
 
 async function loadMobileSlice(index){
   if (!mobileSliceFiles || index < 0 || index >= mobileSliceFiles.length) return;
@@ -936,13 +969,21 @@ async function loadMobileSlice(index){
 mobileSlicePrev.addEventListener('click', () => loadMobileSlice(mobileSliceIndex - 1));
 mobileSliceNext.addEventListener('click', () => loadMobileSlice(mobileSliceIndex + 1));
 
-async function buildDecodedOverview(series){
+async function buildDecodedOverview(series, targetMode = 'overview'){
   if (overviewBuildPromise) return overviewBuildPromise;
   const token = loadToken;
   overviewBuildPromise = (async () => {
     buildingOverview = true;
     mobileSliceToken++;
     mobileSliceNav.classList.remove('show');
+    // DWV decodes into its view layer and refuses to load when that layer
+    // has zero size. Keep a tiny hidden render target while sampling frames.
+    layerGroupEl.style.display = 'block';
+    layerGroupEl.style.position = 'absolute';
+    layerGroupEl.style.width = '2px';
+    layerGroupEl.style.height = '2px';
+    layerGroupEl.style.opacity = '0';
+    layerGroupEl.style.pointerEvents = 'none';
     // DWV retains decoder/render allocations briefly after reset. On iOS,
     // opening hundreds of full-resolution frames in one tab can reload it.
     const maxFrames = mobileDevice ? 20 : 80;
@@ -950,13 +991,15 @@ async function buildDecodedOverview(series){
     const frameIndices = Array.from({length: frameCount}, (_, i) =>
       Math.round(i * (series.files.length - 1) / Math.max(1, frameCount - 1)));
     let projection = null;
+    let volumeWidth = 0, volumeHeight = 0;
+    const volumeLayers = [];
     let decoded = 0;
     let skipped = 0;
     try {
       for (let position = 0; position < frameIndices.length; position++) {
         if (token !== loadToken || currentSeries !== series) return;
         const index = frameIndices[position];
-        setLoading(true, `Birleşik önizleme hazırlanıyor… ${position + 1}/${frameIndices.length}`);
+        setLoading(true, `${targetMode === 'volume' ? '3D' : 'Birleşik'} önizleme hazırlanıyor… ${position + 1}/${frameIndices.length}`);
         try {
           const normalized = await normalizeDicomFile(series.files[index]);
           if (!normalized || normalized.size > 180 * 1024 * 1024) { skipped++; continue; }
@@ -995,6 +1038,19 @@ async function buildDecodedOverview(series){
               width: outWidth, height: outHeight, pixelMm: [1, 1]};
           }
           if (projection.width !== outWidth || projection.height !== outHeight) { skipped++; continue; }
+          const volumeStep = Math.max(1, Math.ceil(Math.max(width, height) / 128));
+          const vw = Math.floor(width / volumeStep), vh = Math.floor(height / volumeStep);
+          if (!volumeWidth) { volumeWidth = vw; volumeHeight = vh; }
+          if (vw === volumeWidth && vh === volumeHeight) {
+            const layer = new Int16Array(vw * vh);
+            for (let y = 0; y < vh; y++) {
+              const row = y * volumeStep * width;
+              for (let x = 0; x < vw; x++) {
+                layer[y * vw + x] = Math.max(-32768, Math.min(32767, buffer[row + x * volumeStep]));
+              }
+            }
+            volumeLayers.push(layer);
+          }
           for (let y = 0; y < outHeight; y++) {
             const row = (y * step + Math.floor(step / 2)) * width;
             for (let x = 0; x < outWidth; x++) {
@@ -1026,19 +1082,26 @@ async function buildDecodedOverview(series){
       projection.lo = percentile(0.01);
       projection.hi = Math.max(projection.lo + 1, percentile(0.995));
       series.overview = projection;
+      series.volumePreview = packVolumeLayers(volumeLayers, volumeWidth, volumeHeight);
       series.overviewSkipped = skipped;
       series.overviewSampled = decoded;
       series.overviewTotal = series.files.length;
-      setMode('overview');
+      setMode(targetMode);
     } catch (err) {
       if (token === loadToken && currentSeries === series) {
         slicesLoadedFor = null;
         setMode('slices');
-        showError('Birleşik görünüm bu DICOM serisinden oluşturulamadı.');
+        showError(`${targetMode === 'volume' ? '3D' : 'Birleşik'} görünüm bu DICOM serisinden oluşturulamadı.`);
       }
     } finally {
       buildingOverview = false;
-      if (token === loadToken && currentSeries === series && series.overview) setLoading(false);
+      layerGroupEl.style.position = '';
+      layerGroupEl.style.width = '';
+      layerGroupEl.style.height = '';
+      layerGroupEl.style.opacity = '';
+      layerGroupEl.style.pointerEvents = '';
+      layerGroupEl.style.display = currentMode === 'slices' ? '' : 'none';
+      if (token === loadToken && currentSeries === series) setLoading(false);
     }
   })().finally(() => { overviewBuildPromise = null; });
   return overviewBuildPromise;
@@ -1049,6 +1112,10 @@ function setMode(mode, filesOverride){
     buildDecodedOverview(currentSeries);
     return;
   }
+  if (mode === 'volume' && currentSeries && !currentSeries.volumePreview) {
+    if (currentSeries.volume) currentSeries.volumePreview = previewFromVolume(currentSeries.volume);
+    if (!currentSeries.volumePreview) { buildDecodedOverview(currentSeries, 'volume'); return; }
+  }
   const files = filesOverride || (currentSeries && currentSeries.files);
   const mobilePreview = mode === 'slices' && mobileDevice && files &&
     (files.length > 100 || files.reduce((sum, file) => sum + file.size, 0) > 180 * 1024 * 1024);
@@ -1058,11 +1125,29 @@ function setMode(mode, filesOverride){
   currentMode = mode;
   document.body.classList.toggle('mode-pano', mode !== 'slices');
   document.body.classList.toggle('mode-overview', mode === 'overview');
+  document.body.classList.toggle('mode-volume', mode === 'volume');
   modeTabs.querySelectorAll('button').forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
-  panoView.style.display = mode !== 'slices' ? 'block' : 'none';
+  panoView.style.display = mode === 'pano' || mode === 'overview' ? 'block' : 'none';
+  volumeView.style.display = mode === 'volume' ? 'block' : 'none';
   layerGroupEl.style.display = mode !== 'slices' ? 'none' : '';
-  panoSection.style.display = mode !== 'slices' ? 'block' : 'none';
-  if (mode !== 'slices') {
+  panoSection.style.display = mode === 'pano' || mode === 'overview' ? 'block' : 'none';
+  volumeSection.style.display = mode === 'volume' ? 'block' : 'none';
+  if (mode === 'volume') {
+    try {
+      if (!volumeViewer) volumeViewer = createVolumeViewer(volumeCanvas);
+      if (!volumeViewer) throw new Error('WebGL2 unavailable');
+      volumeViewer.setVolume(currentSeries.volumePreview);
+      $('volumeNote').textContent = `${currentSeries.overviewSampled && currentSeries.overviewSampled < currentSeries.overviewTotal ? `${currentSeries.overviewTotal} kesitten ${currentSeries.overviewSampled} tanesi örneklendi. ` : currentSeries.volume ? `${Math.min(64, currentSeries.volume.nz)} kesit örneklendi. ` : ''}Bu 3D genel bakış tanı ve ölçüm için cihaz yazılımının yerini tutmaz.`;
+      setLoading(false);
+      requestAnimationFrame(() => volumeViewer.resize());
+    } catch (err) {
+      console.error('3D view error', err);
+      showError('Bu cihazda 3D görünüm açılamadı. Kesitler kullanılabilir.');
+      setMode(currentSeries.overview ? 'overview' : 'slices');
+    }
+    return;
+  }
+  if (mode === 'pano' || mode === 'overview') {
     setLoading(false);
     showPanoramic();
     return;
@@ -1244,17 +1329,55 @@ panoView.addEventListener('pointermove', (e) => {
 panoView.addEventListener('dblclick', fitPanoramic);
 
 function rotateProjection(degrees){
+  if (currentMode === 'volume') { volumeViewer?.rotate(degrees * Math.PI / 180, 0); return; }
   if (currentMode === 'slices') return;
   panoXf.angle = (panoXf.angle + degrees + 360) % 360;
   fitPanoramic();
 }
 
-$('projectionZoomOut').addEventListener('click', () => zoomPanoAt(panoView.clientWidth / 2, panoView.clientHeight / 2, 0.8));
-$('projectionZoomIn').addEventListener('click', () => zoomPanoAt(panoView.clientWidth / 2, panoView.clientHeight / 2, 1.25));
+$('projectionZoomOut').addEventListener('click', () => currentMode === 'volume' ? volumeViewer?.zoom(0.8) : zoomPanoAt(panoView.clientWidth / 2, panoView.clientHeight / 2, 0.8));
+$('projectionZoomIn').addEventListener('click', () => currentMode === 'volume' ? volumeViewer?.zoom(1.25) : zoomPanoAt(panoView.clientWidth / 2, panoView.clientHeight / 2, 1.25));
 $('projectionRotateLeft').addEventListener('click', () => rotateProjection(-90));
 $('projectionRotateRight').addEventListener('click', () => rotateProjection(90));
 
-new ResizeObserver(() => { if (currentMode !== 'slices') fitPanoramic(); }).observe(panoView);
+new ResizeObserver(() => { if (currentMode === 'pano' || currentMode === 'overview') fitPanoramic(); }).observe(panoView);
+new ResizeObserver(() => { if (currentMode === 'volume') volumeViewer?.resize(); }).observe(volumeView);
+
+const volumePointers = new Map();
+let volumePinchDistance = null;
+volumeView.addEventListener('pointerdown', (e) => {
+  volumeView.setPointerCapture(e.pointerId);
+  volumePointers.set(e.pointerId, {x:e.clientX, y:e.clientY});
+  volumeView.classList.add('dragging');
+  volumePinchDistance = null;
+});
+volumeView.addEventListener('pointermove', (e) => {
+  const old = volumePointers.get(e.pointerId);
+  if (!old || !volumeViewer) return;
+  volumePointers.set(e.pointerId, {x:e.clientX, y:e.clientY});
+  if (volumePointers.size === 1) {
+    volumeViewer.rotate((e.clientX - old.x) * 0.008, (e.clientY - old.y) * 0.008);
+  } else if (volumePointers.size === 2) {
+    const [a,b] = [...volumePointers.values()];
+    const distance = Math.hypot(a.x-b.x, a.y-b.y);
+    if (volumePinchDistance) volumeViewer.zoom(distance / volumePinchDistance);
+    volumePinchDistance = distance;
+  }
+});
+for (const event of ['pointerup','pointercancel']) volumeView.addEventListener(event, (e) => {
+  volumePointers.delete(e.pointerId);
+  volumePinchDistance = null;
+  if (!volumePointers.size) volumeView.classList.remove('dragging');
+});
+volumeView.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  volumeViewer?.zoom(e.deltaY < 0 ? 1.12 : 0.89);
+}, {passive:false});
+volumeView.addEventListener('dblclick', () => volumeViewer?.reset());
+volumeThreshold.addEventListener('input', () => {
+  $('volumeThresholdVal').textContent = `%${Math.round(Number(volumeThreshold.value) * 100)}`;
+  volumeViewer?.setThreshold(Number(volumeThreshold.value));
+});
 
 panoBright.addEventListener('input', () => { panoBrightVal.textContent = panoBright.value; drawPanoramic(); });
 panoContrast.addEventListener('input', () => { panoContrastVal.textContent = panoContrast.value; drawPanoramic(); });
@@ -1405,9 +1528,10 @@ $('btnZoom').addEventListener('click', () => applyTool('ZoomAndPan'));
 $('btnScroll').addEventListener('click', () => applyTool('Scroll'));
 $('btnReset').addEventListener('click', () => {
   if (currentMode === 'slices') app.resetZoomPan();
+  else if (currentMode === 'volume') volumeViewer?.reset();
   else { panoXf.angle = 0; fitPanoramic(); }
 });
-$('btnFit').addEventListener('click', () => currentMode !== 'slices' ? fitPanoramic() : app.resetZoomPan());
+$('btnFit').addEventListener('click', () => currentMode === 'volume' ? volumeViewer?.reset() : currentMode !== 'slices' ? fitPanoramic() : app.resetZoomPan());
 $('btnInfoMobile').addEventListener('click', toggleMobilePanel);
 panelCloseBtn.addEventListener('click', closeMobilePanel);
 panelBackdrop.addEventListener('click', closeMobilePanel);
