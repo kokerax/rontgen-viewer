@@ -113,6 +113,13 @@ export async function extractZip(zip, onProgress, options = {}){
   const cd = await readBytes(zip, offset, offset + size);
   const entries = parseEntries(cd, count).filter(en =>
     !en.name.endsWith('/') && !/(^|\/)__MACOSX\//.test(en.name));
+  // Deflated entries must be materialised as Blobs. Reject an archive that
+  // would exhaust a phone before starting inflation, rather than losing the tab.
+  if (options.maxInflatedBytes) {
+    const inflated = entries.reduce((sum, en) => sum +
+      (en.method === 8 && !(options.skipName && options.skipName(en.name.split('/').pop())) ? en.size : 0), 0);
+    if (inflated > options.maxInflatedBytes) throw new Error('zip: mobile memory limit');
+  }
 
   const out = [];
   for (let i = 0; i < entries.length; i++) {

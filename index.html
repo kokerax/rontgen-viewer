@@ -709,6 +709,8 @@ layerResizeObserver.observe(layerGroupEl);
 let scanResult = null;
 let currentSeries = null;
 let loadToken = 0;
+const mobileDevice = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) ||
+  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 
 async function loadFiles(fileList){
   const picked = Array.from(fileList);
@@ -732,16 +734,19 @@ async function loadFiles(fileList){
         if (token === loadToken) setLoading(true, `Zip açılıyor… ${i}/${n}`);
       }, {
         skipName: (name) => isIgnoredFile({name}),
-        sniff: (head) => sniffDicom(head) !== null
+        sniff: (head) => sniffDicom(head) !== null,
+        maxInflatedBytes: mobileDevice ? 180 * 1024 * 1024 : 0
       });
       files = files.concat(inner.filter(f => !isIgnoredFile(f)));
     } catch (err) {
       console.error('zip error', err);
       zipFailed = true;
       if (token === loadToken) {
-        showError(/encrypted/.test(err.message)
-          ? `${zip.name} şifreli; önce bilgisayarda açıp çıkan klasörü seçin.`
-          : `${zip.name} açılamadı; önce bilgisayarda açıp çıkan klasörü seçin.`);
+        showError(/mobile memory limit/.test(err.message)
+          ? 'Bu sıkıştırılmış tomografi telefon belleğine sığmıyor. Bilgisayarda açın veya daha küçük bir DICOM serisi seçin.'
+          : /encrypted/.test(err.message)
+            ? `${zip.name} şifreli; önce bilgisayarda açıp çıkan klasörü seçin.`
+            : `${zip.name} açılamadı; önce bilgisayarda açıp çıkan klasörü seçin.`);
       }
     }
     if (token !== loadToken) return;
@@ -757,7 +762,7 @@ async function loadFiles(fileList){
   try {
     result = await scanDicomFiles(files, (i, n) => {
       if (token === loadToken) setLoading(true, `Dosyalar inceleniyor… ${i}/${n}`);
-    });
+    }, {mobile: mobileDevice, firstVolumeOnly: mobileDevice});
   } catch (err) {
     console.error('scan error', err);
     result = {series: []};
@@ -801,7 +806,27 @@ function buildSeriesUI(series){
   });
 }
 
-function openSeries(s){
+async function openSeries(s){
+  if (s.deferVolume) {
+    const token = loadToken;
+    setLoading(true, 'Seçilen seri hazırlanıyor…');
+    try {
+      const result = await scanDicomFiles(s.files, (i, n) => {
+        if (token === loadToken) setLoading(true, `Seçilen seri hazırlanıyor… ${i}/${n}`);
+      }, {mobile: mobileDevice});
+      if (token !== loadToken) return;
+      for (const other of scanResult.series) {
+        if (other !== s) { other.volume = null; other.arch = null; other.deferVolume = true; }
+      }
+      s.volume = result.series[0]?.volume || null;
+      s.deferVolume = false;
+    } catch (err) {
+      console.error('series scan error', err);
+      setLoading(false);
+      showError('Bu seri telefonda hazırlanamadı. Daha küçük bir seri deneyin.');
+      return;
+    }
+  }
   currentSeries = s;
   seriesList.querySelectorAll('.series-btn').forEach(b => b.classList.toggle('active', b === s.button));
   fileNameLabel.textContent = s.files.length === 1 ? s.files[0].name : `${s.files.length} dosya (seri)`;
@@ -830,6 +855,13 @@ let currentMode = 'slices';
 let slicesLoadedFor = null;
 
 function setMode(mode, filesOverride){
+  const files = filesOverride || (currentSeries && currentSeries.files);
+  if (mode === 'slices' && mobileDevice && files &&
+      (files.length > 100 || files.reduce((sum, file) => sum + file.size, 0) > 180 * 1024 * 1024)) {
+    setLoading(false);
+    showError('Bu tomografinin kesitleri telefon belleğini aşar. Panoramik görünümü kullanın veya bilgisayarda açın.');
+    return;
+  }
   currentMode = mode;
   document.body.classList.toggle('mode-pano', mode === 'pano');
   modeTabs.querySelectorAll('button').forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
@@ -841,7 +873,6 @@ function setMode(mode, filesOverride){
     showPanoramic();
     return;
   }
-  const files = filesOverride || (currentSeries && currentSeries.files);
   if (!files) return;
   if (slicesLoadedFor === files) {
     requestAnimationFrame(safeResize);

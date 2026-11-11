@@ -111,13 +111,20 @@ function dirName(file){
 }
 
 // box-average downsample of one frame, applying rescale slope/intercept
-function downsampleFrame(px, rows, cols, f, slope, intercept){
+function downsampleFrame(px, rows, cols, f, slope, intercept, fast = false){
   const oh = Math.floor(rows / f);
   const ow = Math.floor(cols / f);
   const out = new Int16Array(ow * oh);
   const norm = 1 / (f * f);
   for (let y = 0; y < oh; y++) {
     for (let x = 0; x < ow; x++) {
+      if (fast) {
+        const cy = y * f + Math.floor(f / 2);
+        const cx = x * f + Math.floor(f / 2);
+        const v = px[cy * cols + cx] * slope + intercept;
+        out[y * ow + x] = Math.max(-32768, Math.min(32767, v));
+        continue;
+      }
       let sum = 0;
       for (let dy = 0; dy < f; dy++) {
         let idx = (y * f + dy) * cols + x * f;
@@ -134,13 +141,13 @@ function downsampleFrame(px, rows, cols, f, slope, intercept){
 // Reads and parses every file once. Returns the DICOM series found, each
 // with its files and, for uncompressed single-frame stacks, the
 // downsampled pixel slices needed for the panoramic reconstruction.
-export async function scanDicomFiles(files, onProgress){
+export async function scanDicomFiles(files, onProgress, options = {}){
   const seriesMap = new Map();
   let skipped = 0;
   for (let i = 0; i < files.length; i++) {
     let file = files[i];
-    if (onProgress && (i % 10 === 0 || i === files.length - 1)) {
-      onProgress(i + 1, files.length);
+    if (i % (options.mobile ? 2 : 10) === 0 || i === files.length - 1) {
+      if (onProgress) onProgress(i + 1, files.length);
       await new Promise(r => setTimeout(r, 0));
     }
     if (isIgnoredFile(file)) { skipped++; continue; }
@@ -170,12 +177,14 @@ export async function scanDicomFiles(files, onProgress){
         folder: dirName(file),
         files: [],
         slices: [],
-        canVolume: true
+        canVolume: true,
+        deferVolume: !!(options.mobile && options.firstVolumeOnly && seriesMap.size > 0)
       };
       seriesMap.set(uid, s);
     }
     s.files.push(file);
 
+    if (s.deferVolume) continue;
     if (!s.canVolume) continue;
     const ts = str(elements, '00020010');
     const rows = Number(first(elements, '00280010'));
@@ -194,10 +203,10 @@ export async function scanDicomFiles(files, onProgress){
     const pixels = elements['7FE00010'].value[0];
     if (!pixels || pixels.length < rows * cols) { s.canVolume = false; s.slices = []; continue; }
 
-    const f = Math.max(1, Math.ceil(Math.max(rows, cols) / TARGET_SIDE));
+    const f = Math.max(1, Math.ceil(Math.max(rows, cols) / (options.mobile ? 160 : TARGET_SIDE)));
     const slope = Number(str(elements, '00281053') || 1) || 1;
     const intercept = Number(str(elements, '00281052') || 0) || 0;
-    const ds = downsampleFrame(pixels, rows, cols, f, slope, intercept);
+    const ds = downsampleFrame(pixels, rows, cols, f, slope, intercept, !!options.mobile);
     s.slices.push({
       ipp, iop, f,
       rowSpacing: spacing[0], colSpacing: spacing[1],
