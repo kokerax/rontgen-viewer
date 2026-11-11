@@ -283,6 +283,8 @@
   .panel-note{ font-size:11.5px; color:var(--text-dim); line-height:1.45; margin:8px 0 0; }
   .btn.block{ width:100%; justify-content:center; }
   body.mode-pano .slices-only{ display:none !important; }
+  body.mode-overview .pano-only,
+  body.mode-overview .side-label{ display:none !important; }
 
   footer{
     flex:0 0 auto; padding:6px 14px; text-align:center;
@@ -397,6 +399,7 @@
 
     <div id="modeTabs">
       <button data-mode="pano">🦷 Panoramik</button>
+      <button data-mode="overview">◈ Birleşik</button>
       <button data-mode="slices">📑 Kesitler</button>
     </div>
     <div id="mobileSliceNav" aria-label="Kesitlerde gezin">
@@ -433,7 +436,7 @@
     </div>
 
     <div class="panel-section" id="panoSection" style="display:none;">
-      <h3>Panoramik</h3>
+      <h3 id="projectionTitle">Panoramik</h3>
       <div class="control">
         <label for="panoBright"><span>Parlaklık</span><span id="panoBrightVal">0</span></label>
         <input type="range" id="panoBright" min="-100" max="100" value="0" step="1">
@@ -442,16 +445,16 @@
         <label for="panoContrast"><span>Kontrast</span><span id="panoContrastVal">0</span></label>
         <input type="range" id="panoContrast" min="-100" max="100" value="0" step="1">
       </div>
-      <div class="control">
+      <div class="control pano-only">
         <label for="panoThick"><span>Kesit kalınlığı</span><span id="panoThickVal">20 mm</span></label>
         <input type="range" id="panoThick" min="2" max="40" value="20" step="1">
       </div>
-      <div class="control">
+      <div class="control pano-only">
         <label for="panoShift"><span>Eğri konumu (dil ↔ yanak)</span><span id="panoShiftVal">0 mm</span></label>
         <input type="range" id="panoShift" min="-12" max="12" value="0" step="0.5">
       </div>
       <button class="btn block" id="panoDownloadBtn">⬇️ Panoramiği indir (PNG)</button>
-      <p class="panel-note">Panoramik, 3D tomografiden diş kavsi otomatik bulunarak oluşturulur; tanı için cihazın kendi yazılımındaki ölçümlerin yerini tutmaz.</p>
+      <p class="panel-note" id="projectionNote">Panoramik, 3D tomografiden diş kavsi otomatik bulunarak oluşturulur; tanı için cihazın kendi yazılımındaki ölçümlerin yerini tutmaz.</p>
     </div>
 
     <div class="panel-section" id="seriesSection" style="display:none;">
@@ -844,9 +847,10 @@ async function openSeries(s){
       }, {mobile: mobileDevice});
       if (token !== loadToken) return;
       for (const other of scanResult.series) {
-        if (other !== s) { other.volume = null; other.arch = null; other.deferVolume = true; }
+        if (other !== s) { other.volume = null; other.overview = null; other.arch = null; other.deferVolume = true; }
       }
       s.volume = result.series[0]?.volume || null;
+      s.overview = result.series[0]?.overview || null;
       s.deferVolume = false;
     } catch (err) {
       console.error('series scan error', err);
@@ -860,13 +864,13 @@ async function openSeries(s){
   fileNameLabel.textContent = s.files.length === 1 ? s.files[0].name : `${s.files.length} dosya (seri)`;
   slicesLoadedFor = null;
   app.reset();
-  if (s.volume) {
-    if (!s.arch) s.arch = detectArch(s.volume);
-    if (s.arch) {
-      modeTabs.classList.add('show');
-      setMode('pano');
-      return;
-    }
+  if (s.volume && !s.arch) s.arch = detectArch(s.volume);
+  if (s.arch || s.overview) {
+    modeTabs.querySelector('[data-mode="pano"]').style.display = s.arch ? '' : 'none';
+    modeTabs.querySelector('[data-mode="overview"]').style.display = s.overview ? '' : 'none';
+    modeTabs.classList.add('show');
+    setMode(s.arch ? 'pano' : 'overview');
+    return;
   }
   modeTabs.classList.remove('show');
   setMode('slices');
@@ -921,12 +925,13 @@ function setMode(mode, filesOverride){
   mobileSliceNav.classList.toggle('show', !!mobilePreview && files.length > 1);
   mobileSliceFiles = mobilePreview && files.length > 1 ? files : null;
   currentMode = mode;
-  document.body.classList.toggle('mode-pano', mode === 'pano');
+  document.body.classList.toggle('mode-pano', mode !== 'slices');
+  document.body.classList.toggle('mode-overview', mode === 'overview');
   modeTabs.querySelectorAll('button').forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
-  panoView.style.display = mode === 'pano' ? 'block' : 'none';
-  layerGroupEl.style.display = mode === 'pano' ? 'none' : '';
-  panoSection.style.display = mode === 'pano' ? 'block' : 'none';
-  if (mode === 'pano') {
+  panoView.style.display = mode !== 'slices' ? 'block' : 'none';
+  layerGroupEl.style.display = mode !== 'slices' ? 'none' : '';
+  panoSection.style.display = mode !== 'slices' ? 'block' : 'none';
+  if (mode !== 'slices') {
     setLoading(false);
     showPanoramic();
     return;
@@ -966,20 +971,31 @@ function panoParams(){
 
 function showPanoramic(){
   const s = currentSeries;
-  if (!s || !s.volume || !s.arch) return;
+  if (!s || (!s.arch && !s.overview)) return;
+  const isOverview = currentMode === 'overview';
+  $('projectionTitle').textContent = isOverview ? 'Birleşik görünüm' : 'Panoramik';
+  $('projectionNote').textContent = isOverview
+    ? 'Tüm kesitlerin en yoğun noktaları üst üste gösterilir. Bu 2D genel bakıştır; 3D model veya tanı görüntüsü değildir.'
+    : 'Panoramik, 3D tomografiden diş kavsi otomatik bulunarak oluşturulur; tanı için cihazın kendi yazılımındaki ölçümlerin yerini tutmaz.';
+  $('panoDownloadBtn').textContent = isOverview ? '⬇️ Birleşik görünümü indir (PNG)' : '⬇️ Panoramiği indir (PNG)';
   const params = panoParams();
-  const sameParams = pano && pano.series === s &&
+  const sameParams = pano && pano.series === s && pano.mode === currentMode &&
     pano.thicknessMm === params.thicknessMm && pano.shiftMm === params.shiftMm;
   if (!sameParams) {
-    const image = computePanoramic(s.volume, s.arch, params);
+    const image = isOverview ? s.overview : computePanoramic(s.volume, s.arch, params);
     if (!image) {
+      if (!isOverview && s.overview) {
+        modeTabs.querySelector('[data-mode="pano"]').style.display = 'none';
+        setMode('overview');
+        return;
+      }
       showError('Panoramik oluşturulamadı; kesitler gösteriliyor.');
       modeTabs.classList.remove('show');
       setMode('slices');
       return;
     }
-    const fresh = !pano || pano.series !== s;
-    pano = {series: s, image, ...params};
+    const fresh = !pano || pano.series !== s || pano.mode !== currentMode;
+    pano = {series: s, mode: currentMode, image, ...params};
     panoCanvas.width = image.width;
     panoCanvas.height = image.height;
     // pixels are not square in mm: stretch the canvas, not the data
@@ -1080,7 +1096,7 @@ panoView.addEventListener('pointermove', (e) => {
 }));
 panoView.addEventListener('dblclick', fitPanoramic);
 
-new ResizeObserver(() => { if (currentMode === 'pano') fitPanoramic(); }).observe(panoView);
+new ResizeObserver(() => { if (currentMode !== 'slices') fitPanoramic(); }).observe(panoView);
 
 panoBright.addEventListener('input', () => { panoBrightVal.textContent = panoBright.value; drawPanoramic(); });
 panoContrast.addEventListener('input', () => { panoContrastVal.textContent = panoContrast.value; drawPanoramic(); });
@@ -1106,7 +1122,7 @@ $('panoDownloadBtn').addEventListener('click', () => {
   out.toBlob((blob) => {
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = 'panoramik.png';
+    a.download = pano.mode === 'overview' ? 'birlesik-gorunum.png' : 'panoramik.png';
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -1224,8 +1240,8 @@ $('resetToolBtn').addEventListener('click', () => app.resetZoomPan());
 $('btnWL').addEventListener('click', () => applyTool('WindowLevel'));
 $('btnZoom').addEventListener('click', () => applyTool('ZoomAndPan'));
 $('btnScroll').addEventListener('click', () => applyTool('Scroll'));
-$('btnReset').addEventListener('click', () => currentMode === 'pano' ? fitPanoramic() : app.resetZoomPan());
-$('btnFit').addEventListener('click', () => currentMode === 'pano' ? fitPanoramic() : app.resetZoomPan());
+$('btnReset').addEventListener('click', () => currentMode !== 'slices' ? fitPanoramic() : app.resetZoomPan());
+$('btnFit').addEventListener('click', () => currentMode !== 'slices' ? fitPanoramic() : app.resetZoomPan());
 $('btnInfoMobile').addEventListener('click', toggleMobilePanel);
 panelCloseBtn.addEventListener('click', closeMobilePanel);
 panelBackdrop.addEventListener('click', closeMobilePanel);

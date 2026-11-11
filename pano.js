@@ -230,12 +230,34 @@ export async function scanDicomFiles(files, onProgress, options = {}){
 
   const series = [];
   for (const s of seriesMap.values()) {
+    s.overview = s.canVolume ? buildOverview(s.slices) : null;
     s.volume = s.canVolume ? buildVolume(s.slices) : null;
     delete s.slices;
     series.push(s);
   }
   series.sort((a, b) => b.files.length - a.files.length);
   return {series, skipped};
+}
+
+// A small maximum-intensity projection of the complete stack. Unlike the
+// dental panorama it also works when an axial volume or arch cannot be made.
+export function buildOverview(slices){
+  if (slices.length < 2) return null;
+  const first = slices[0];
+  if (!slices.every(s => s.width === first.width && s.height === first.height &&
+      s.iop.every((v, i) => Math.abs(v - first.iop[i]) < 1e-3))) return null;
+  const data = new Int16Array(first.width * first.height).fill(-32768);
+  for (const slice of slices) {
+    for (let i = 0; i < data.length; i++) data[i] = Math.max(data[i], slice.data[i]);
+  }
+  const sorted = Array.from(data).sort((a, b) => a - b);
+  const lo = sorted[Math.floor(sorted.length * 0.01)];
+  const hi = sorted[Math.floor(sorted.length * 0.995)];
+  return {
+    data, width: first.width, height: first.height,
+    pixelMm: [first.colSpacing * first.f, first.rowSpacing * first.f],
+    lo, hi: Math.max(lo + 1, hi)
+  };
 }
 
 // Stacks axial slices into a volume. Slices are kept at their native
