@@ -248,6 +248,16 @@
     display:none; gap:4px; padding:4px;
     background:rgba(20,23,28,0.9); border:1px solid var(--border); border-radius:10px;
   }
+  #mobileSliceNav{
+    position:absolute; top:64px; left:50%; transform:translateX(-50%); z-index:13;
+    display:none; align-items:center; gap:12px; padding:6px;
+    white-space:nowrap; color:var(--text); background:rgba(20,23,28,.94);
+    border:1px solid var(--border); border-radius:12px;
+  }
+  #mobileSliceNav.show{display:flex;}
+  #mobileSliceNav button{min-width:44px; min-height:44px; border:1px solid var(--border);
+    border-radius:8px; background:var(--panel2); color:var(--text); font-size:20px;}
+  #mobileSliceNav button:disabled{opacity:.4;}
   #modeTabs.show{ display:flex; }
   #modeTabs button{
     appearance:none; border:0; background:transparent; color:var(--text-dim);
@@ -389,6 +399,11 @@
       <button data-mode="pano">🦷 Panoramik</button>
       <button data-mode="slices">📑 Kesitler</button>
     </div>
+    <div id="mobileSliceNav" aria-label="Kesitlerde gezin">
+      <button id="mobileSlicePrev" aria-label="Önceki kesit">‹</button>
+      <span id="mobileSliceCount">Kesit 1/1</span>
+      <button id="mobileSliceNext" aria-label="Sonraki kesit">›</button>
+    </div>
 
     <div id="loadingOverlay">
       <div class="spinner"></div>
@@ -497,7 +512,7 @@ import {
   App, AppOptions, ViewConfig, ToolConfig, Index, getDwvVersion
 } from "dwv";
 import {
-  scanDicomFiles, isIgnoredFile, sniffDicom, detectArch, computePanoramic, renderPanoramic
+  scanDicomFiles, isIgnoredFile, sniffDicom, normalizeDicomFile, detectArch, computePanoramic, renderPanoramic
 } from "./pano.js";
 import {isZipFile, extractZip} from "./zip.js";
 
@@ -526,6 +541,10 @@ const metaTable = $('metaTable');
 const pickFolderBtn = $('pickFolderBtn');
 const folderInput = $('folderInput');
 const modeTabs = $('modeTabs');
+const mobileSliceNav = $('mobileSliceNav');
+const mobileSliceCount = $('mobileSliceCount');
+const mobileSlicePrev = $('mobileSlicePrev');
+const mobileSliceNext = $('mobileSliceNext');
 const panoView = $('panoView');
 const panoCanvas = $('panoCanvas');
 const panoSection = $('panoSection');
@@ -581,7 +600,11 @@ function enterViewer(){
 
 function backToDropzone(){
   loadToken++;
+  mobileSliceToken++;
+  mobileSliceFiles = null;
+  mobileSliceNav.classList.remove('show');
   app.reset();
+  currentSeries = null;
   setMode('slices');
   modeTabs.classList.remove('show');
   seriesSection.style.display = 'none';
@@ -770,6 +793,11 @@ async function loadFiles(fileList){
   if (token !== loadToken) return;
   if (result.series.length === 0) {
     setLoading(false);
+    if (mobileDevice && files.length > 100) {
+      backToDropzone();
+      showError('Bu arşivde telefonda açılabilen DICOM görüntüsü bulunamadı. Farklı bir arşiv deneyin.');
+      return;
+    }
     // let dwv try anyway; it reports its own error if it fails too
     showSlicesForFiles(files);
     return;
@@ -853,15 +881,45 @@ function showSlicesForFiles(files){
 // ---------- mode: panoramic / slices ----------
 let currentMode = 'slices';
 let slicesLoadedFor = null;
+let mobileSliceFiles = null;
+let mobileSliceIndex = 0;
+let mobileSliceToken = 0;
+
+async function loadMobileSlice(index){
+  if (!mobileSliceFiles || index < 0 || index >= mobileSliceFiles.length) return;
+  const token = ++mobileSliceToken;
+  const file = mobileSliceFiles[index];
+  mobileSliceIndex = index;
+  mobileSliceCount.textContent = `Kesit ${index + 1}/${mobileSliceFiles.length}`;
+  mobileSlicePrev.disabled = index === 0;
+  mobileSliceNext.disabled = index === mobileSliceFiles.length - 1;
+  setLoading(true, `Kesit açılıyor… ${index + 1}/${mobileSliceFiles.length}`);
+  try {
+    const normalized = await normalizeDicomFile(file);
+    if (!normalized || normalized.size > 180 * 1024 * 1024) throw new Error('slice too large');
+    const single = normalized instanceof Blob ? normalized :
+      new File([await normalized.arrayBuffer()], normalized.name);
+    if (token !== mobileSliceToken) return;
+    app.reset();
+    isFirstRender = true;
+    app.loadFiles([single]);
+  } catch (err) {
+    if (token !== mobileSliceToken) return;
+    setLoading(false);
+    showError('Bu kesit açılamadı. Yanındaki kesiti deneyin.');
+  }
+}
+
+mobileSlicePrev.addEventListener('click', () => loadMobileSlice(mobileSliceIndex - 1));
+mobileSliceNext.addEventListener('click', () => loadMobileSlice(mobileSliceIndex + 1));
 
 function setMode(mode, filesOverride){
   const files = filesOverride || (currentSeries && currentSeries.files);
-  if (mode === 'slices' && mobileDevice && files &&
-      (files.length > 100 || files.reduce((sum, file) => sum + file.size, 0) > 180 * 1024 * 1024)) {
-    setLoading(false);
-    showError('Bu tomografinin kesitleri telefon belleğini aşar. Panoramik görünümü kullanın veya bilgisayarda açın.');
-    return;
-  }
+  const mobilePreview = mode === 'slices' && mobileDevice && files &&
+    (files.length > 100 || files.reduce((sum, file) => sum + file.size, 0) > 180 * 1024 * 1024);
+  if (!mobilePreview || mobileSliceFiles !== files) mobileSliceToken++;
+  mobileSliceNav.classList.toggle('show', !!mobilePreview && files.length > 1);
+  mobileSliceFiles = mobilePreview && files.length > 1 ? files : null;
   currentMode = mode;
   document.body.classList.toggle('mode-pano', mode === 'pano');
   modeTabs.querySelectorAll('button').forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
@@ -874,6 +932,15 @@ function setMode(mode, filesOverride){
     return;
   }
   if (!files) return;
+  if (mobilePreview) {
+    if (files.length === 1) {
+      backToDropzone();
+      showError('Bu tek dosya telefon belleğine sığmıyor. Bilgisayarda açın.');
+      return;
+    }
+    loadMobileSlice(Math.floor(files.length / 2));
+    return;
+  }
   if (slicesLoadedFor === files) {
     requestAnimationFrame(safeResize);
     return;
