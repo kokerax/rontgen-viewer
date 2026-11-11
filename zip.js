@@ -103,8 +103,8 @@ async function inflateHead(raw, n){
   return out.subarray(0, got);
 }
 
-// Returns the archive's files as File objects carrying a `relativePath`
-// (archive path), like files coming from a dropped folder.
+// Returns archive entries with `relativePath` (archive path). Large deflated
+// archives use file-like lazy entries so only one image is inflated at a time.
 // `options.skipName(name)` drops entries by name; `options.sniff(head)`
 // sees the first 132 bytes of a compressed entry and decides whether it
 // is worth inflating (vendor volumes can be close to a gigabyte).
@@ -113,13 +113,9 @@ export async function extractZip(zip, onProgress, options = {}){
   const cd = await readBytes(zip, offset, offset + size);
   const entries = parseEntries(cd, count).filter(en =>
     !en.name.endsWith('/') && !/(^|\/)__MACOSX\//.test(en.name));
-  // Deflated entries must be materialised as Blobs. Reject an archive that
-  // would exhaust a phone before starting inflation, rather than losing the tab.
-  if (options.maxInflatedBytes) {
-    const inflated = entries.reduce((sum, en) => sum +
-      (en.method === 8 && !(options.skipName && options.skipName(en.name.split('/').pop())) ? en.size : 0), 0);
-    if (inflated > options.maxInflatedBytes) throw new Error('zip: mobile memory limit');
-  }
+  const inflated = entries.reduce((sum, en) => sum +
+    (en.method === 8 && !(options.skipName && options.skipName(en.name.split('/').pop())) ? en.size : 0), 0);
+  const lazyDeflate = !!(options.maxInflatedBytes && inflated > options.maxInflatedBytes);
 
   const out = [];
   for (let i = 0; i < entries.length; i++) {
@@ -137,7 +133,26 @@ export async function extractZip(zip, onProgress, options = {}){
       blob = raw;
     } else if (en.method === 8) {
       if (typeof DecompressionStream === 'undefined') throw new Error('zip: no DecompressionStream');
-      if (options.sniff && !options.sniff(await inflateHead(raw, 132))) continue;
+      if (options.maxInflatedBytes && en.size > options.maxInflatedBytes) {
+        throw new Error('zip: mobile memory limit');
+      }
+      const head = await inflateHead(raw, 132);
+      if (options.sniff && !options.sniff(head)) continue;
+      if (lazyDeflate) {
+        // A file-like view: inflate only the entry currently being scanned.
+        // Keeping hundreds of inflated Blobs alive can terminate mobile Safari.
+        const inflate = () => new Response(raw.stream().pipeThrough(
+          new DecompressionStream('deflate-raw'))).arrayBuffer();
+        out.push({
+          name: base, size: en.size, relativePath: en.name,
+          arrayBuffer: inflate,
+          slice(start = 0, end = en.size) {
+            if (start === 0 && end <= head.length) return new Blob([head.subarray(0, end)]);
+            return {arrayBuffer: async () => (await inflate()).slice(start, end)};
+          }
+        });
+        continue;
+      }
       blob = await new Response(raw.stream().pipeThrough(new DecompressionStream('deflate-raw'))).blob();
     } else {
       // unsupported compression (e.g. deflate64, bzip2): skip the entry

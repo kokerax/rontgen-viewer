@@ -73,7 +73,21 @@ export async function normalizeDicomFile(file){
   if (!kind) return null;
   // explicit VR: dwv's default guess for bare datasets is right
   if (kind !== 'implicit') return file;
-  const fixed = new File([...buildFileMeta(IMPLICIT_LE), file], file.name);
+  const meta = new Blob(buildFileMeta(IMPLICIT_LE));
+  // Large deflated ZIPs expose file-like lazy entries rather than Blobs.
+  // Keep their prefixed form lazy too, or a bare-DICOM archive fills RAM.
+  const fixed = file instanceof Blob
+    ? new File([meta, file], file.name)
+    : {
+        name: file.name,
+        size: meta.size + file.size,
+        async arrayBuffer() { return new Blob([meta, await file.arrayBuffer()]).arrayBuffer(); },
+        slice(start = 0, end = meta.size + file.size) {
+          if (start === 0 && end <= meta.size) return meta.slice(0, end);
+          const source = this;
+          return {arrayBuffer: async () => (await source.arrayBuffer()).slice(start, end)};
+        }
+      };
   const rel = file.webkitRelativePath || file.relativePath;
   if (rel) {
     try { Object.defineProperty(fixed, 'relativePath', {value: rel}); } catch (err) { /* read-only */ }
