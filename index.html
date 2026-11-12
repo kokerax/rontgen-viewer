@@ -558,7 +558,7 @@ import {
 import {
   scanDicomFiles, isIgnoredFile, sniffDicom, normalizeDicomFile, detectArch, computePanoramic, computeDetailedPanoramic, renderPanoramic
 } from "./pano.js?v=combined-7";
-import {isZipFile, extractZip} from "./zip.js";
+import {isZipFile, extractZip} from "./zip.js?v=nnt-1";
 import {packVolumeLayers, previewFromVolume, createVolumeViewer} from "./volume3d.js?v=1";
 
 // ---------- DOM refs ----------
@@ -629,11 +629,13 @@ let hasData = false;
 let currentDataId = null;
 let nLoadErrors = 0;
 let buildingOverview = false;
+let errorToastTimer = null;
 
-function showError(msg){
+function showError(msg, duration = 6000){
+  clearTimeout(errorToastTimer);
   errorToast.textContent = msg;
   errorToast.classList.add('show');
-  setTimeout(() => errorToast.classList.remove('show'), 6000);
+  errorToastTimer = setTimeout(() => errorToast.classList.remove('show'), duration);
 }
 
 function setLoading(on, text){
@@ -811,6 +813,7 @@ async function loadFiles(fileList){
   pano = null;
   enterViewer();
   let zipFailed = false;
+  let nntViewerArchive = false;
   for (const zip of zips) {
     setLoading(true, 'Zip açılıyor…');
     try {
@@ -819,6 +822,7 @@ async function loadFiles(fileList){
       }, {
         skipName: (name) => isIgnoredFile({name}),
         sniff: (head) => sniffDicom(head) !== null,
+        onArchiveInfo: info => { nntViewerArchive ||= info.nntViewer; },
         maxInflatedBytes: mobileDevice ? 180 * 1024 * 1024 : 0
       });
       files = files.concat(inner.filter(f => !isIgnoredFile(f)));
@@ -838,7 +842,13 @@ async function loadFiles(fileList){
   if (files.length === 0) {
     setLoading(false);
     backToDropzone();
-    if (!zipFailed) showError('Zip içinde DICOM dosyası bulunamadı.');
+    if (!zipFailed) {
+      if (nntViewerArchive) {
+        showError('Bu NNTViewer paketi DICOM içermiyor. Çekim merkezinden DICOM aksiyel kesit serisini isteyin; gelen ZIP’i seçin.', 12000);
+      } else {
+        showError('Zip içinde DICOM dosyası bulunamadı.');
+      }
+    }
     return;
   }
   setLoading(true, 'Dosyalar inceleniyor…');

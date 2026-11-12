@@ -113,6 +113,8 @@ export async function extractZip(zip, onProgress, options = {}){
   const cd = await readBytes(zip, offset, offset + size);
   const entries = parseEntries(cd, count).filter(en =>
     !en.name.endsWith('/') && !/(^|\/)__MACOSX\//.test(en.name));
+  options.onArchiveInfo?.({nntViewer: entries.some(en =>
+    /(?:^|[\\/])nntviewer\.exe$/i.test(en.name))});
   const inflated = entries.reduce((sum, en) => sum +
     (en.method === 8 && !(options.skipName && options.skipName(en.name.split('/').pop())) ? en.size : 0), 0);
   const lazyDeflate = !!(options.maxInflatedBytes && inflated > options.maxInflatedBytes);
