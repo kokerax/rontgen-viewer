@@ -22,6 +22,81 @@ const TARGET_SIDE = 420;
 
 const MIN_VOLUME_SLICES = 40;
 
+// Verified NewTom NNTViewer axial frame: CNNTImg, a 32-bit byte count,
+// little-endian unsigned 16-bit pixels, then a footer with voxel spacing.
+const NNT_HEADER_SIZE = 21;
+const NNT_FOOTER_SPACING = 40;
+const NNT_MAGIC = 'CNNTImg';
+
+export function sniffNntImg(head){
+  if (head.length < NNT_HEADER_SIZE || head[0] !== 0xff || head[1] !== 0xff) return false;
+  for (let i = 0; i < NNT_MAGIC.length; i++) {
+    if (head[6 + i] !== NNT_MAGIC.charCodeAt(i)) return false;
+  }
+  const bytes = new DataView(head.buffer, head.byteOffset, head.byteLength).getUint32(17, true);
+  const side = Math.sqrt(bytes / 2);
+  return Number.isInteger(side) && side >= 128 && side <= 2048;
+}
+
+export async function readNntFrame(file){
+  const buffer = await file.arrayBuffer();
+  const head = new Uint8Array(buffer, 0, Math.min(buffer.byteLength, NNT_HEADER_SIZE));
+  if (!sniffNntImg(head)) throw new Error('unsupported NNT frame');
+  const view = new DataView(buffer);
+  const bytes = view.getUint32(17, true);
+  const side = Math.sqrt(bytes / 2);
+  const footer = NNT_HEADER_SIZE + bytes;
+  if (buffer.byteLength > footer + 4 * 1024 * 1024) throw new Error('unsupported NNT frame size');
+  if (footer + NNT_FOOTER_SPACING + 12 > buffer.byteLength) throw new Error('truncated NNT frame');
+  const spacing = [0, 1, 2].map(i => view.getFloat32(footer + NNT_FOOTER_SPACING + i * 4, true));
+  if (!spacing.every(v => Number.isFinite(v) && v > 0.01 && v < 5)) throw new Error('invalid NNT spacing');
+  const pixels = new Uint16Array(side * side);
+  for (let i = 0; i < pixels.length; i++) pixels[i] = view.getUint16(NNT_HEADER_SIZE + i * 2, true);
+  return {pixels, rows: side, cols: side, spacing};
+}
+
+export async function scanNntFiles(files, onProgress, options = {}){
+  const numbered = files.map(file => ({file, match: /\.a(\d{3,4})$/i.exec(file.name)}))
+    .filter(entry => entry.match)
+    .sort((a, b) => Number(a.match[1]) - Number(b.match[1]));
+  if (numbered.length < MIN_VOLUME_SLICES ||
+      numbered.some((entry, i) => i && Number(entry.match[1]) !== Number(numbered[i - 1].match[1]) + 1)) {
+    return {series: [], skipped: files.length};
+  }
+  const slices = [];
+  const series = {uid: 'nnt', description: 'NewTom NNTViewer', modality: 'CBCT', folder: '',
+    format: 'nnt', files: numbered.map(entry => entry.file), overview: null, overviewCount: 0};
+  let first = null;
+  for (let i = 0; i < numbered.length; i++) {
+    const file = numbered[i].file;
+    const frame = await readNntFrame(file);
+    if (first && (frame.rows !== first.rows || frame.cols !== first.cols ||
+        frame.spacing.some((v, j) => Math.abs(v - first.spacing[j]) > 0.001))) {
+      throw new Error('inconsistent NNT frames');
+    }
+    first ||= frame;
+    const f = Math.max(1, Math.ceil(frame.rows / (options.mobile ? 160 : 256)));
+    const ds = downsampleFrame(frame.pixels, frame.rows, frame.cols, f, 1, 0, !!options.mobile);
+    updateOverview(series, ds, [1, 0, 0, 0, 1, 0], frame.spacing, f);
+    const z = i * frame.spacing[2];
+    slices.push({ipp: [0, 0, z], iop: [1, 0, 0, 0, 1, 0], f,
+      rowSpacing: frame.spacing[1], colSpacing: frame.spacing[0],
+      data: ds.data, width: ds.width, height: ds.height,
+      source: {kind: 'nnt', file, rows: frame.rows, cols: frame.cols, f,
+        rowSpacing: frame.spacing[1], colSpacing: frame.spacing[0], slope: 1, intercept: 0,
+        positionZ: z, transferSyntax: 'nnt'}});
+    if (i % (options.mobile ? 4 : 12) === 0 || i === numbered.length - 1) {
+      onProgress?.(i + 1, numbered.length);
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+  }
+  series.overview = finishOverview(series.overview, series.overviewCount);
+  series.volume = buildVolume(slices);
+  delete series.overviewCount;
+  if (!series.volume) throw new Error('invalid NNT volume');
+  return {series: [series], skipped: files.length - numbered.length};
+}
+
 export function isIgnoredFile(file){
   return IGNORED_NAME.test(file.name);
 }
@@ -644,9 +719,14 @@ export async function computeDetailedPanoramic(vol, arch,
   for (let z = 0; z < height; z++) {
     if (cancelled?.()) return null;
     const source = sources[z];
-    const parser = new DicomParser();
-    parser.parse(await source.file.arrayBuffer());
-    let pixels = parser.getDicomElements()['7FE00010']?.value?.[0];
+    let pixels;
+    if (source.kind === 'nnt') {
+      pixels = (await readNntFrame(source.file)).pixels;
+    } else {
+      const parser = new DicomParser();
+      parser.parse(await source.file.arrayBuffer());
+      pixels = parser.getDicomElements()['7FE00010']?.value?.[0];
+    }
     if (source.transferSyntax === JPEG_LOSSLESS_TS) {
       if (!jpegDecoder) return null;
       pixels = await jpegDecoder.decode(pixels, source.bitsAllocated, source.isSigned);

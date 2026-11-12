@@ -298,6 +298,7 @@
   .panel-note{ font-size:11.5px; color:var(--text-dim); line-height:1.45; margin:8px 0 0; }
   .btn.block{ width:100%; justify-content:center; }
   body.mode-pano .slices-only{ display:none !important; }
+  body.nnt-slices #sliceSection{ display:block !important; }
   body:not(.mode-pano) .projection-only{ display:none !important; }
   body.mode-overview .pano-only,
   body.mode-overview .side-label{ display:none !important; }
@@ -402,7 +403,7 @@
         <button class="btn primary" id="pickFileBtn">📂 Dosya Seç</button>
         <button class="btn" id="pickFolderBtn">🗂️ Klasör Seç</button>
       </div>
-      <div class="formats">Desteklenen: .dcm, .dicom, uzantısız DICOM dosyaları, klasörler ve .zip arşivleri</div>
+      <div class="formats">Desteklenen: .dcm, .dicom, uzantısız DICOM, NewTom NNTViewer kesitleri, klasörler ve .zip arşivleri</div>
       <div class="hint">🦷 <b>3D dental tomografi (CBCT)</b> geldiyse dosyaları tek tek değil, <b>klasörün tamamını</b> seçin ya da sürükleyin; panoramik görüntü otomatik oluşturulur. WeTransfer'den inen <b>.zip</b> dosyasını da açmadan doğrudan seçebilirsiniz.</div>
       <div class="privacy-note">
         <span class="emoji">🔒</span>
@@ -556,9 +557,9 @@ import {
   App, AppOptions, ViewConfig, ToolConfig, Index, getDwvVersion
 } from "dwv";
 import {
-  scanDicomFiles, isIgnoredFile, sniffDicom, normalizeDicomFile, detectArch, computePanoramic, computeDetailedPanoramic, renderPanoramic
-} from "./pano.js?v=combined-7";
-import {isZipFile, extractZip} from "./zip.js?v=nnt-1";
+  scanDicomFiles, scanNntFiles, readNntFrame, sniffNntImg, isIgnoredFile, sniffDicom, normalizeDicomFile, detectArch, computePanoramic, computeDetailedPanoramic, renderPanoramic
+} from "./pano.js?v=nnt-2";
+import {isZipFile, extractZip} from "./zip.js?v=nnt-2";
 import {packVolumeLayers, previewFromVolume, createVolumeViewer} from "./volume3d.js?v=1";
 
 // ---------- DOM refs ----------
@@ -658,6 +659,7 @@ function backToDropzone(){
   mobileSliceToken++;
   mobileSliceFiles = null;
   mobileSliceNav.classList.remove('show');
+  document.body.classList.remove('nnt-series');
   app.reset();
   currentSeries = null;
   setMode('slices');
@@ -803,7 +805,7 @@ async function loadFiles(fileList){
   const zips = picked.filter(isZipFile);
   let files = picked.filter(f => !isZipFile(f) && !isIgnoredFile(f));
   if (files.length === 0 && zips.length === 0) {
-    showError('Seçilenler arasında DICOM dosyası bulunamadı.');
+    showError('Seçilenler arasında görüntü dosyası bulunamadı.');
     return;
   }
   const token = ++loadToken;
@@ -821,7 +823,7 @@ async function loadFiles(fileList){
         if (token === loadToken) setLoading(true, `Zip açılıyor… ${i}/${n}`);
       }, {
         skipName: (name) => isIgnoredFile({name}),
-        sniff: (head) => sniffDicom(head) !== null,
+        sniff: (head) => sniffDicom(head) !== null || sniffNntImg(head),
         onArchiveInfo: info => { nntViewerArchive ||= info.nntViewer; },
         maxInflatedBytes: mobileDevice ? 180 * 1024 * 1024 : 0
       });
@@ -844,19 +846,26 @@ async function loadFiles(fileList){
     backToDropzone();
     if (!zipFailed) {
       if (nntViewerArchive) {
-        showError('Bu NNTViewer paketi DICOM içermiyor. Çekim merkezinden DICOM aksiyel kesit serisini isteyin; gelen ZIP’i seçin.', 12000);
+        showError('Bu NNTViewer paketinin görüntü biçimi desteklenen kesitlerle eşleşmedi. Çekim merkezinden DICOM dışa aktarımı isteyin.', 12000);
       } else {
-        showError('Zip içinde DICOM dosyası bulunamadı.');
+        showError('Zip içinde desteklenen görüntü dosyası bulunamadı.');
       }
     }
     return;
   }
   setLoading(true, 'Dosyalar inceleniyor…');
+  const nntFiles = files.filter(f => /\.a\d{3,4}$/i.test(f.name));
+  const dicomCandidates = files.filter(f => !/\.a\d{3,4}$/i.test(f.name));
   let result;
   try {
-    result = await scanDicomFiles(files, (i, n) => {
+    result = dicomCandidates.length ? await scanDicomFiles(dicomCandidates, (i, n) => {
       if (token === loadToken) setLoading(true, `Dosyalar inceleniyor… ${i}/${n}`);
-    }, {mobile: mobileDevice, firstVolumeOnly: mobileDevice});
+    }, {mobile: mobileDevice, firstVolumeOnly: mobileDevice}) : {series: []};
+    if (!result.series.length && nntFiles.length >= 40) {
+      result = await scanNntFiles(nntFiles, (i, n) => {
+        if (token === loadToken) setLoading(true, `NNT kesitleri hazırlanıyor… ${i}/${n}`);
+      }, {mobile: mobileDevice});
+    }
   } catch (err) {
     console.error('scan error', err);
     result = {series: []};
@@ -864,6 +873,11 @@ async function loadFiles(fileList){
   if (token !== loadToken) return;
   if (result.series.length === 0) {
     setLoading(false);
+    if (nntViewerArchive || nntFiles.length >= 40) {
+      backToDropzone();
+      showError('Bu NNTViewer paketinin kesitleri okunamadı. Çekim merkezinden DICOM dışa aktarımı isteyin.', 12000);
+      return;
+    }
     if (mobileDevice && files.length > 100) {
       backToDropzone();
       showError('Bu arşivde telefonda açılabilen DICOM görüntüsü bulunamadı. Farklı bir arşiv deneyin.');
@@ -933,6 +947,8 @@ async function openSeries(s){
   currentSeries = s;
   seriesList.querySelectorAll('.series-btn').forEach(b => b.classList.toggle('active', b === s.button));
   fileNameLabel.textContent = s.files.length === 1 ? s.files[0].name : `${s.files.length} dosya (seri)`;
+  document.body.classList.toggle('nnt-series', s.format === 'nnt');
+  if (s.format !== 'nnt') sliceSection.style.display = 'none';
   slicesLoadedFor = null;
   app.reset();
   if (s.volume && !s.arch) s.arch = detectArch(s.volume);
@@ -940,6 +956,9 @@ async function openSeries(s){
   panoButton.style.display = s.files.length > 1 ? '' : 'none';
   panoButton.classList.toggle('unavailable', !s.arch);
   panoButton.title = s.arch ? 'Diş kavsi boyunca panoramik görünüm' : 'Bu seride otomatik panoramik oluşturulamadı';
+  panoView.querySelectorAll('.side-label').forEach(label => {
+    label.style.display = s.format === 'nnt' ? 'none' : '';
+  });
   if (s.arch || s.overview) {
     modeTabs.querySelector('[data-mode="overview"]').style.display = s.overview ? '' : 'none';
     modeTabs.querySelector('[data-mode="volume"]').style.display = s.files.length > 1 ? '' : 'none';
@@ -975,6 +994,50 @@ let mobileSliceToken = 0;
 let overviewBuildPromise = null;
 let volumeViewer = null;
 
+async function loadNntSlice(index){
+  const series = currentSeries;
+  if (series?.format !== 'nnt' || index < 0 || index >= series.files.length) return;
+  const token = ++mobileSliceToken;
+  mobileSliceIndex = index;
+  mobileSliceCount.textContent = `Kesit ${index + 1}/${series.files.length}`;
+  mobileSlicePrev.disabled = index === 0;
+  mobileSliceNext.disabled = index === series.files.length - 1;
+  sliceSlider.value = index;
+  sliceNum.textContent = `${index + 1} / ${series.files.length}`;
+  setLoading(true, `Kesit açılıyor… ${index + 1}/${series.files.length}`);
+  try {
+    const frame = await readNntFrame(series.files[index]);
+    if (token !== mobileSliceToken || currentSeries !== series || currentMode !== 'slices') return;
+    const hist = new Uint32Array(16384);
+    let count = 0;
+    for (let i = 0; i < frame.pixels.length; i += 3) {
+      const value = frame.pixels[i];
+      if (value > 0 && value < hist.length) { hist[value]++; count++; }
+    }
+    const quantile = fraction => {
+      const target = count * fraction;
+      let seen = 0;
+      for (let value = 0; value < hist.length; value++) {
+        seen += hist[value];
+        if (seen >= target) return value;
+      }
+      return hist.length - 1;
+    };
+    const lo = quantile(0.01);
+    const hi = Math.max(lo + 1, quantile(0.995));
+    pano = {series, mode: 'slices', image: {
+      width: frame.cols, height: frame.rows, data: frame.pixels,
+      pixelMm: [frame.spacing[0], frame.spacing[1]], lo, hi
+    }};
+    presentPanoramicImage(pano.image, true);
+    setLoading(false);
+  } catch (err) {
+    if (token !== mobileSliceToken) return;
+    setLoading(false);
+    showError('Bu NNT kesiti açılamadı. Yanındaki kesiti deneyin.');
+  }
+}
+
 async function loadMobileSlice(index){
   if (!mobileSliceFiles || index < 0 || index >= mobileSliceFiles.length) return;
   const token = ++mobileSliceToken;
@@ -1000,8 +1063,8 @@ async function loadMobileSlice(index){
   }
 }
 
-mobileSlicePrev.addEventListener('click', () => loadMobileSlice(mobileSliceIndex - 1));
-mobileSliceNext.addEventListener('click', () => loadMobileSlice(mobileSliceIndex + 1));
+mobileSlicePrev.addEventListener('click', () => (currentSeries?.format === 'nnt' ? loadNntSlice : loadMobileSlice)(mobileSliceIndex - 1));
+mobileSliceNext.addEventListener('click', () => (currentSeries?.format === 'nnt' ? loadNntSlice : loadMobileSlice)(mobileSliceIndex + 1));
 
 async function buildDecodedOverview(series, targetMode = 'overview'){
   if (overviewBuildPromise) return overviewBuildPromise;
@@ -1160,21 +1223,32 @@ function setMode(mode, filesOverride){
     if (!currentSeries.volumePreview) { buildDecodedOverview(currentSeries, 'volume'); return; }
   }
   const files = filesOverride || (currentSeries && currentSeries.files);
+  const nntSlices = mode === 'slices' && currentSeries?.format === 'nnt';
+  document.body.classList.toggle('nnt-slices', nntSlices);
   const mobilePreview = mode === 'slices' && mobileDevice && files &&
     (files.length > 100 || files.reduce((sum, file) => sum + file.size, 0) > 180 * 1024 * 1024);
   if (!mobilePreview || mobileSliceFiles !== files) mobileSliceToken++;
-  mobileSliceNav.classList.toggle('show', !!mobilePreview && files.length > 1);
+  mobileSliceNav.classList.toggle('show', !!(mobilePreview || nntSlices) && files.length > 1);
   mobileSliceFiles = mobilePreview && files.length > 1 ? files : null;
   currentMode = mode;
-  document.body.classList.toggle('mode-pano', mode !== 'slices');
+  document.body.classList.toggle('mode-pano', mode !== 'slices' || nntSlices);
   document.body.classList.toggle('mode-overview', mode === 'overview');
   document.body.classList.toggle('mode-volume', mode === 'volume');
   modeTabs.querySelectorAll('button').forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
-  panoView.style.display = mode === 'pano' || mode === 'overview' ? 'block' : 'none';
+  panoView.style.display = mode === 'pano' || mode === 'overview' || nntSlices ? 'block' : 'none';
   volumeView.style.display = mode === 'volume' ? 'block' : 'none';
-  layerGroupEl.style.display = mode !== 'slices' ? 'none' : '';
+  layerGroupEl.style.display = mode !== 'slices' || nntSlices ? 'none' : '';
   panoSection.style.display = mode === 'pano' || mode === 'overview' ? 'block' : 'none';
   volumeSection.style.display = mode === 'volume' ? 'block' : 'none';
+  if (nntSlices) {
+    sliceSection.style.display = 'block';
+    sliceSlider.min = 0;
+    sliceSlider.max = files.length - 1;
+    sliceSlider.oninput = () => loadNntSlice(Number(sliceSlider.value));
+    const index = Math.min(files.length - 1, Math.max(0, mobileSliceIndex || Math.floor(files.length / 2)));
+    loadNntSlice(index);
+    return;
+  }
   if (mode === 'volume') {
     try {
       if (!volumeViewer) volumeViewer = createVolumeViewer(volumeCanvas);
@@ -1310,6 +1384,7 @@ function startDetailedPanoramic(series, params){
 
 function panoWindow(){
   const {lo, hi} = pano.image;
+  if (pano.mode === 'slices') return [lo, hi];
   const range = hi - lo;
   const b = Number(panoBright.value) / 100;   // -1..1
   const c = Number(panoContrast.value) / 100; // -1..1
