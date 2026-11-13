@@ -125,6 +125,141 @@ function buildFileMeta(transferSyntax){
   return [pre, lenEl, version, tsHead, tsVal];
 }
 
+const LONG_VR = new Set(['OB', 'OD', 'OF', 'OL', 'OV', 'OW', 'SQ', 'SV', 'UC', 'UN', 'UR', 'UT', 'UV']);
+const ENCAPSULATED_PIXEL = new Uint8Array([224,127,16,0,79,66,0,0,255,255,255,255]);
+const EMPTY_ITEM = new Uint8Array([254,255,0,224,0,0,0,0]);
+const SEQUENCE_END = new Uint8Array([254,255,221,224,0,0,0,0]);
+
+function joinBytes(parts){
+  const result = new Uint8Array(parts.reduce((n, part) => n + part.length, 0));
+  let offset = 0;
+  for (const part of parts) { result.set(part, offset); offset += part.length; }
+  return result;
+}
+
+// Walk the explicit-VR header, including undefined-length functional groups.
+// A nested icon's Pixel Data must not be mistaken for the volume's data.
+function pixelHeaderOffset(bytes){
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (sniffDicom(bytes) !== 'part10') return null;
+  let offset = 132, depth = 0;
+  while (offset + 8 <= bytes.length) {
+    const group = view.getUint16(offset, true), element = view.getUint16(offset + 2, true);
+    if (group === 0xfffe) {
+      const size = view.getUint32(offset + 4, true);
+      if (element === 0xe000 && size === 0xffffffff) { depth++; offset += 8; }
+      else if (element === 0xe00d || element === 0xe0dd) { depth--; offset += 8; }
+      else offset += 8 + size;
+      if (depth < 0) return null;
+      continue;
+    }
+    const vr = String.fromCharCode(bytes[offset + 4], bytes[offset + 5]);
+    if (!VRS.has(vr)) return null;
+    const head = LONG_VR.has(vr) ? 12 : 8;
+    if (offset + head > bytes.length) return null;
+    const size = head === 12 ? view.getUint32(offset + 8, true) : view.getUint16(offset + 6, true);
+    if (!depth && group === 0x7fe0 && element === 0x0010) return {offset, head, size};
+    if (size === 0xffffffff) {
+      if (vr !== 'SQ') return null;
+      depth++; offset += head;
+    } else offset += head + size;
+  }
+  return null;
+}
+
+function dicomElement(tag, vr, value){
+  const bytes = vr === 'US' ? new Uint8Array(2) : new TextEncoder().encode(String(value));
+  if (vr === 'US') new DataView(bytes.buffer).setUint16(0, Number(value), true);
+  const length = bytes.length + bytes.length % 2;
+  const out = new Uint8Array(8 + length);
+  const view = new DataView(out.buffer);
+  view.setUint16(0, parseInt(tag.slice(0, 4), 16), true);
+  view.setUint16(2, parseInt(tag.slice(4), 16), true);
+  out[4] = vr.charCodeAt(0); out[5] = vr.charCodeAt(1);
+  view.setUint16(6, length, true);
+  out.set(bytes, 8);
+  if (length > bytes.length) out[out.length - 1] = vr === 'UI' ? 0 : 32;
+  return out;
+}
+
+// Large Enhanced CT exports can hold hundreds of JPEG Lossless frames in
+// one file. Expose standard single-frame DICOM views without holding the
+// complete compressed file or all decoded frames in RAM.
+async function splitMultiframeDicom(file){
+  let prefix, pixel;
+  for (let limit = 65536; limit <= 4 * 1024 * 1024; limit *= 2) {
+    prefix = new Uint8Array(await file.slice(0, Math.min(limit, file.size)).arrayBuffer());
+    pixel = pixelHeaderOffset(prefix);
+    if (pixel || prefix.length === file.size) break;
+  }
+  if (!pixel || pixel.size !== 0xffffffff) return null;
+  const parser = new DicomParser();
+  parser.parse(joinBytes([prefix.subarray(0, pixel.offset), ENCAPSULATED_PIXEL, EMPTY_ITEM, SEQUENCE_END]).buffer);
+  const elements = parser.getDicomElements();
+  const frames = Number(first(elements, '00280008') || 1);
+  if (str(elements, '00020010') !== JPEG_LOSSLESS_TS || frames < 2 || frames > 5000) return null;
+  const rows = Number(first(elements, '00280010')), cols = Number(first(elements, '00280011'));
+  if (!rows || !cols || rows * cols > 4096 * 4096 || Number(first(elements, '00280002')) !== 1) return null;
+  const perFrame = elements['52009230']?.value;
+  const shared = elements['52009229']?.value?.[0];
+  const nested = (frame, sequence, tag) => frame?.[sequence]?.value?.[0]?.[tag]?.value ||
+    shared?.[sequence]?.value?.[0]?.[tag]?.value || elements[tag]?.value;
+  const dataStart = pixel.offset + pixel.head;
+  const tableHead = new DataView(await file.slice(dataStart, dataStart + 8).arrayBuffer());
+  if (tableHead.getUint32(0, true) !== 0xe000fffe || tableHead.getUint32(4, true) !== frames * 4) return null;
+  const table = new DataView(await file.slice(dataStart + 8, dataStart + 8 + frames * 4).arrayBuffer());
+  const fragmentsStart = dataStart + 8 + frames * 4;
+  const offsets = Array.from({length: frames}, (_, i) => table.getUint32(i * 4, true));
+  if (offsets[0] !== 0 || offsets.some((offset, i) => fragmentsStart + offset + 8 > file.size ||
+      (i && offset <= offsets[i - 1]))) return null;
+  const seriesUid = str(elements, '0020000E') || '2.25.' + BigInt('0x' + crypto.randomUUID().replaceAll('-', '')).toString();
+  const instanceBase = '2.25.' + BigInt('0x' + crypto.randomUUID().replaceAll('-', '')).toString();
+  const out = [];
+  for (let i = 0; i < frames; i++) {
+    const frame = perFrame?.[i];
+    const position = nested(frame, '00209113', '00200032');
+    const orientation = nested(frame, '00209116', '00200037');
+    const spacing = nested(frame, '00289110', '00280030');
+    // Do not invent anatomical ordering when the export omits per-frame geometry.
+    if (!position || position.length !== 3 || !orientation || orientation.length !== 6 || !spacing || spacing.length !== 2 ||
+        ![...position, ...orientation, ...spacing].every(v => Number.isFinite(Number(v)))) return null;
+    const tags = [
+      ['00080016','UI','1.2.840.10008.5.1.4.1.1.2'], ['00080018','UI',instanceBase + '.' + (i + 1)],
+      ['00080060','CS','CT'], ['0008103E','LO','CBCT'],
+      ['0020000D','UI',str(elements, '0020000D') || seriesUid], ['0020000E','UI',seriesUid],
+      ['00200013','IS',i + 1], ['00200032','DS',position.join('\\')], ['00200037','DS',orientation.join('\\')],
+      ['00280002','US',1], ['00280004','CS',str(elements, '00280004') || 'MONOCHROME2'],
+      ['00280010','US',rows], ['00280011','US',cols], ['00280030','DS',spacing.join('\\')],
+      ['00280100','US',first(elements, '00280100')], ['00280101','US',first(elements, '00280101')],
+      ['00280102','US',first(elements, '00280102')], ['00280103','US',first(elements, '00280103') || 0],
+      ['00281052','DS',nested(frame, '00289145', '00281052')?.[0] || 0],
+      ['00281053','DS',nested(frame, '00289145', '00281053')?.[0] || 1]
+    ];
+    const header = joinBytes([...buildFileMeta(JPEG_LOSSLESS_TS), ...tags.map(tag => dicomElement(...tag)), ENCAPSULATED_PIXEL, EMPTY_ITEM]);
+    const start = fragmentsStart + offsets[i];
+    const boundary = i + 1 < frames ? fragmentsStart + offsets[i + 1] : file.size - 8;
+    const arrayBuffer = async () => {
+      const item = new Uint8Array(await file.slice(start, start + 8).arrayBuffer());
+      const view = new DataView(item.buffer);
+      const length = view.getUint32(4, true);
+      if (view.getUint32(0, true) !== 0xe000fffe || length < 2 || length > 32 * 1024 * 1024 || start + 8 + length !== boundary) {
+        throw new Error('unsupported multiframe fragment layout');
+      }
+      const image = new Uint8Array(await file.slice(start + 8, boundary).arrayBuffer());
+      if (image[0] !== 0xff || image[1] !== 0xd8) throw new Error('invalid multiframe JPEG');
+      return joinBytes([header, item, image, SEQUENCE_END]).buffer;
+    };
+    out.push({name: `frame-${String(i + 1).padStart(5, '0')}.dcm`, relativePath: file.relativePath || file.name,
+      streamSource: file, streamIndex: i,
+      size: header.length + boundary - start + SEQUENCE_END.length, arrayBuffer,
+      slice(start = 0, end = this.size) {
+        if (end <= header.length) return new Blob([header.subarray(start, end)]);
+        return {arrayBuffer: async () => (await arrayBuffer()).slice(start, end)};
+      }});
+  }
+  return out;
+}
+
 // Some vendors (e.g. J. Morita OneVolumeViewer exports) write bare
 // datasets: no preamble, no file meta, implicit VR. dwv then guesses
 // explicit VR and misreads every tag. Detect that and prepend a proper
@@ -257,6 +392,15 @@ function createJpegLosslessDecoder(){
 // with its files and, for supported single-frame axial stacks, the
 // downsampled pixel slices needed for the panoramic reconstruction.
 export async function scanDicomFiles(files, onProgress, options = {}){
+  const expanded = [];
+  for (const file of files) {
+    const largeDicom = !isIgnoredFile(file) && file.size > 32 * 1024 * 1024 &&
+      sniffDicom(new Uint8Array(await file.slice(0, 132).arrayBuffer())) !== null;
+    const frames = largeDicom ? await splitMultiframeDicom(file) : null;
+    if (!frames && largeDicom && options.mobile && file.size > 180 * 1024 * 1024) throw new Error('dicom: mobile memory limit');
+    expanded.push(...(frames || [file]));
+  }
+  files = expanded;
   const seriesMap = new Map();
   let skipped = 0;
   let jpegDecoder = null;
@@ -468,7 +612,10 @@ export function detectArch(vol){
   // only enamel and metal are this dense; a looser cut also takes in the
   // skull and spine of large field-of-view scans and the band covers
   // the whole head
-  const hi = percentileFromHistogram(hist, total, 0.9997);
+  // Saturated enamel/metal may occupy more than the selected percentile.
+  // Keep those voxels eligible for the strictly-greater threshold below.
+  const hi = Math.min(percentileFromHistogram(hist, total, 0.9997),
+    percentileFromHistogram(hist, total, 1) - 1);
 
   const prof = vol.data.map(slice => {
     let n = 0;
@@ -715,8 +862,15 @@ export async function computeDetailedPanoramic(vol, arch,
   const pad = paddingValue(vol);
   let finite = 0;
   const jpegDecoder = first.transferSyntax === JPEG_LOSSLESS_TS ? createJpegLosslessDecoder() : null;
+  const order = Array.from({length: height}, (_, i) => i);
+  if (first.file.streamSource && sources.every(source => source.file.streamSource === first.file.streamSource)) {
+    // Anatomical Z order may be the reverse of ZIP stream order. Decode in
+    // physical file order and place each result at its anatomical output row.
+    order.sort((a, b) => sources[a].file.streamIndex - sources[b].file.streamIndex);
+  }
   try {
-  for (let z = 0; z < height; z++) {
+  for (let work = 0; work < height; work++) {
+    const z = order[work];
     if (cancelled?.()) return null;
     const source = sources[z];
     let pixels;
@@ -757,8 +911,8 @@ export async function computeDetailedPanoramic(vol, arch,
         finite++;
       }
     }
-    if (z % 8 === 0 || z === height - 1) {
-      onProgress?.(z + 1, height);
+    if (work % 8 === 0 || work === height - 1) {
+      onProgress?.(work + 1, height);
       await new Promise(resolve => setTimeout(resolve, 0));
     }
   }

@@ -103,6 +103,44 @@ async function inflateHead(raw, n){
   return out.subarray(0, got);
 }
 
+// A single forward reader retains only its current output chunk. Reading
+// backwards restarts decompression; it never creates the complete inflated file.
+function inflatedRanges(raw, size){
+  let reader = null, chunk = null, chunkStart = 0, position = 0;
+  let queue = Promise.resolve();
+  async function read(start, end){
+    start = Math.max(0, Math.min(size, start));
+    end = Math.max(start, Math.min(size, end));
+    if (!reader || start < chunkStart) {
+      if (reader) await reader.cancel().catch(() => {});
+      reader = raw.stream().pipeThrough(new DecompressionStream('deflate-raw')).getReader();
+      chunk = null; chunkStart = position = 0;
+    }
+    const output = new Uint8Array(end - start);
+    let copied = 0;
+    while (copied < output.length) {
+      if (!chunk || start + copied >= chunkStart + chunk.length) {
+        const next = await reader.read();
+        if (next.done) throw new Error('zip: truncated inflated entry');
+        chunk = next.value;
+        chunkStart = position;
+        position += chunk.length;
+        continue;
+      }
+      const offset = start + copied - chunkStart;
+      const take = Math.min(chunk.length - offset, output.length - copied);
+      output.set(chunk.subarray(offset, offset + take), copied);
+      copied += take;
+    }
+    return output.buffer;
+  }
+  return (start, end) => {
+    const result = queue.then(() => read(start, end));
+    queue = result.catch(() => {});
+    return result;
+  };
+}
+
 // Returns archive entries with `relativePath` (archive path). Large deflated
 // archives use file-like lazy entries so only one image is inflated at a time.
 // `options.skipName(name)` drops entries by name; `options.sniff(head)`
@@ -118,10 +156,10 @@ export async function extractZip(zip, onProgress, options = {}){
   options.onArchiveInfo?.({nntViewer});
   const inflated = entries.reduce((sum, en) => sum +
     (en.method === 8 && !(options.skipName && options.skipName(en.name.split('/').pop())) ? en.size : 0), 0);
-  const lazyDeflate = nntViewer || !!(options.maxInflatedBytes && inflated > options.maxInflatedBytes);
+  const lazyDeflate = nntViewer || inflated > (options.maxInflatedBytes || 128 * 1024 * 1024);
   const stored = entries.reduce((sum, en) => sum +
     (en.method === 0 && !(options.skipName && options.skipName(en.name.split('/').pop())) ? en.size : 0), 0);
-  const lazyStored = nntViewer || !!(options.maxInflatedBytes && stored > options.maxInflatedBytes);
+  const lazyStored = nntViewer || stored > (options.maxInflatedBytes || 128 * 1024 * 1024);
 
   const out = [];
   for (let i = 0; i < entries.length; i++) {
@@ -153,22 +191,25 @@ export async function extractZip(zip, onProgress, options = {}){
       if (typeof DecompressionStream === 'undefined') throw new Error('zip: no DecompressionStream');
       const head = await inflateHead(raw, 132);
       if (options.sniff && !options.sniff(head)) continue;
-      // Vendor archives also contain giant .vol/.pak companions. Check the
-      // limit only after sniffing, so non-DICOM data cannot block the images.
-      if (options.maxInflatedBytes && en.size > options.maxInflatedBytes) {
-        throw new Error('zip: mobile memory limit');
-      }
+      // Vendor archives also contain giant .vol/.pak companions. Sniff first;
+      // retained DICOM entries can then be read by range under the buffer limit.
       if (lazyDeflate) {
         // A file-like view: inflate only the entry currently being scanned.
         // Keeping hundreds of inflated Blobs alive can terminate mobile Safari.
-        const inflate = () => new Response(raw.stream().pipeThrough(
-          new DecompressionStream('deflate-raw'))).arrayBuffer();
+        const readRange = inflatedRanges(raw, en.size);
+        const inflate = () => {
+          if (options.maxInflatedBytes && en.size > options.maxInflatedBytes) {
+            throw new Error('dicom: mobile memory limit');
+          }
+          return new Response(raw.stream().pipeThrough(
+            new DecompressionStream('deflate-raw'))).arrayBuffer();
+        };
         out.push({
           name: base, size: en.size, relativePath: en.name,
           arrayBuffer: inflate,
           slice(start = 0, end = en.size) {
             if (start === 0 && end <= head.length) return new Blob([head.subarray(0, end)]);
-            return {arrayBuffer: async () => (await inflate()).slice(start, end)};
+            return {arrayBuffer: () => readRange(start, end)};
           }
         });
         continue;
